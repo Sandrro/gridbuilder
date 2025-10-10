@@ -43,6 +43,7 @@ from shapely.geometry import box
 from shapely.prepared import prep
 from shapely.strtree import STRtree
 from shapely.ops import unary_union
+from shapely.errors import GEOSException
 try:  # Shapely >= 2.0
     from shapely.validation import make_valid as _shapely_make_valid
 except ImportError:  # pragma: no cover - compatibility with Shapely < 2.0
@@ -81,6 +82,14 @@ _GLOBAL_ZONE_TIMEOUT: Optional[float] = None
 
 class ZoneTimeoutError(RuntimeError):
     """Raised when processing of a single zone exceeds the allotted time."""
+
+
+class ZoneProcessingError(RuntimeError):
+    """Raised when a zone cannot be processed due to geometry issues."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _check_deadline(deadline: Optional[float]) -> None:
@@ -232,10 +241,13 @@ def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame,
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
             continue
-        if zone_prepared.contains(geom):
-            intersection = geom
-        else:
-            intersection = geom.intersection(zone_geom)
+        try:
+            if zone_prepared.contains(geom):
+                intersection = geom
+            else:
+                intersection = geom.intersection(zone_geom)
+        except GEOSException as exc:
+            raise ZoneProcessingError("topology_error", f"Failed to compute building intersection: {exc}") from exc
         intersection = _ensure_valid_geometry(intersection)
         if intersection is None or intersection.is_empty:
             continue
@@ -299,10 +311,13 @@ def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame,
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
             continue
-        if zone_prepared.contains(geom):
-            intersection = geom
-        else:
-            intersection = geom.intersection(zone_geom)
+        try:
+            if zone_prepared.contains(geom):
+                intersection = geom
+            else:
+                intersection = geom.intersection(zone_geom)
+        except GEOSException as exc:
+            raise ZoneProcessingError("topology_error", f"Failed to compute service intersection: {exc}") from exc
         intersection = _ensure_valid_geometry(intersection)
         if intersection is None or intersection.is_empty:
             continue
@@ -436,7 +451,7 @@ def _get_zone_value(zone_row, attribute: str, default=None):
     return getattr(zone_row, attribute, default)
 
 
-def _make_timeout_record(zone_row) -> Optional[Dict[str, object]]:
+def _make_timeout_record(zone_row, *, reason: str = "timeout", message: Optional[str] = None) -> Optional[Dict[str, object]]:
     zone_geom = _get_zone_value(zone_row, "geometry")
     if zone_geom is None or zone_geom.is_empty:
         return None
@@ -444,7 +459,10 @@ def _make_timeout_record(zone_row) -> Optional[Dict[str, object]]:
     if zone_id is None:
         zone_id = _get_zone_value(zone_row, "id")
     zone_type = _get_zone_value(zone_row, "functional_zone_type_name")
-    return {"zone_id": zone_id, "zone_type": zone_type, "geometry": zone_geom}
+    record = {"zone_id": zone_id, "zone_type": zone_type, "geometry": zone_geom, "reason": reason}
+    if message:
+        record["message"] = message
+    return record
 
 
 def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame,
@@ -454,11 +472,20 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
         deadline = monotonic() + zone_timeout
 
     _check_deadline(deadline)
-    zone_geom = _get_zone_value(zone_row, "geometry")
-    if zone_geom is None or zone_geom.is_empty:
+    zone_geom_original = _get_zone_value(zone_row, "geometry")
+    if zone_geom_original is None or zone_geom_original.is_empty:
         return None
 
     _check_deadline(deadline)
+    zone_geom = _ensure_valid_geometry(zone_geom_original)
+    if zone_geom is None or zone_geom.is_empty:
+        raise ZoneProcessingError("invalid_geometry", "Zone geometry is invalid and could not be repaired")
+
+    try:
+        zone_prepared = prep(zone_geom)
+    except GEOSException as exc:
+        raise ZoneProcessingError("invalid_geometry", f"Failed to prepare zone geometry: {exc}") from exc
+
     zone_area = zone_geom.area
     if zone_area <= 0:
         return None
@@ -467,7 +494,6 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
     if zone_id is None:
         zone_id = _get_zone_value(zone_row, "id")
     rng = random.Random(_hash_seed(zone_id))
-    zone_prepared = prep(zone_geom)
 
     buildings_candidates = buildings_df
     if hasattr(buildings_df, "sindex") and buildings_df.sindex is not None:
@@ -519,12 +545,15 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
             cell_geom = box(x0, y0, x1, y1)
             if not _bbox_intersects(cell_geom.bounds, zone_bounds):
                 continue
-            if not zone_prepared.intersects(cell_geom):
-                continue
-            if zone_prepared.contains(cell_geom):
-                intersection = cell_geom
-            else:
-                intersection = cell_geom.intersection(zone_geom)
+            try:
+                if not zone_prepared.intersects(cell_geom):
+                    continue
+                if zone_prepared.contains(cell_geom):
+                    intersection = cell_geom
+                else:
+                    intersection = cell_geom.intersection(zone_geom)
+            except GEOSException as exc:
+                raise ZoneProcessingError("topology_error", f"Failed to compute cell intersection: {exc}") from exc
             if intersection.is_empty:
                 continue
 
@@ -555,7 +584,11 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                     _check_deadline(deadline)
                     if not _bbox_intersects(building.bounds, cell_geom.bounds):
                         continue
-                    coverage = building.geometry.intersection(cell_geom).area
+                    try:
+                        coverage_geom = building.geometry.intersection(cell_geom)
+                    except GEOSException as exc:
+                        raise ZoneProcessingError("topology_error", f"Failed to intersect building with cell: {exc}") from exc
+                    coverage = coverage_geom.area
                     if coverage <= 0:
                         continue
                     ratio = coverage / cell_area if cell_area > 0 else 0.0
@@ -590,7 +623,11 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                             points = list(service.geometry.geoms)
                             coverage_ratio = 1.0 if any(cell_geom.contains(pt) for pt in points) else 0.0
                     else:
-                        coverage = service.geometry.intersection(cell_geom).area
+                        try:
+                            coverage_geom = service.geometry.intersection(cell_geom)
+                        except GEOSException as exc:
+                            raise ZoneProcessingError("topology_error", f"Failed to intersect service with cell: {exc}") from exc
+                        coverage = coverage_geom.area
                         coverage_ratio = coverage / cell_area if cell_area > 0 else 0.0
                     if coverage_ratio <= 0:
                         continue
@@ -705,7 +742,7 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
 
                 def submit_next() -> bool:
                     try:
-                         zone_row = next(task_iter)
+                        zone_row = next(task_iter)
                     except StopIteration:
                         return False
                     future = executor.submit(_process_zone_with_globals, zone_row)
@@ -723,7 +760,15 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                         try:
                             result = future.result()
                         except ZoneTimeoutError:
-                            record = _make_timeout_record(zone_row)
+                            record = _make_timeout_record(zone_row, reason="timeout")
+                            if record is not None:
+                                timeout_records.append(record)
+                            if progress_bar is not None:
+                                progress_bar.update(1)
+                            submit_next()
+                            continue
+                        except ZoneProcessingError as exc:
+                            record = _make_timeout_record(zone_row, reason=exc.reason, message=str(exc))
                             if record is not None:
                                 timeout_records.append(record)
                             if progress_bar is not None:
@@ -749,7 +794,14 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                 try:
                     result = _process_zone(zone_row, buildings, services, grid_size, zone_timeout)
                 except ZoneTimeoutError:
-                    record = _make_timeout_record(zone_row)
+                    record = _make_timeout_record(zone_row, reason="timeout")
+                    if record is not None:
+                        timeout_records.append(record)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    continue
+                except ZoneProcessingError as exc:
+                    record = _make_timeout_record(zone_row, reason=exc.reason, message=str(exc))
                     if record is not None:
                         timeout_records.append(record)
                     if progress_bar is not None:
