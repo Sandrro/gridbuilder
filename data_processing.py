@@ -39,6 +39,7 @@ import pandas as pd
 try:
     import pyarrow as pa
     import pyarrow.parquet as pq
+    import pyarrow.types as pa_types
 except ImportError as exc:  # pragma: no cover - hard failure without pyarrow
     raise ImportError("pyarrow is required for Parquet output. Please install pyarrow.") from exc
 from shapely import wkb
@@ -81,6 +82,39 @@ _GLOBAL_BUILDINGS: Optional[gpd.GeoDataFrame] = None
 _GLOBAL_SERVICES: Optional[gpd.GeoDataFrame] = None
 _GLOBAL_GRID_SIZE: float = 0.0
 _GLOBAL_ZONE_TIMEOUT: Optional[float] = None
+
+
+_DESCRIPTION_SCHEMA = pa.schema(
+    [
+        pa.field("zone_id", pa.string()),
+        pa.field("zone_type", pa.string()),
+        pa.field("total_living_area", pa.float64()),
+        pa.field("building_coverage_ratio", pa.float64()),
+        pa.field("storeys_min", pa.float64()),
+        pa.field("storeys_max", pa.float64()),
+        pa.field("service_counts", pa.string()),
+        pa.field("service_capacities", pa.string()),
+    ]
+)
+
+_GRID_SCHEMA = pa.schema(
+    [
+        pa.field("zone_id", pa.string()),
+        pa.field("cell_id", pa.string()),
+        pa.field("row", pa.int64()),
+        pa.field("col", pa.int64()),
+        pa.field("ring_index", pa.int64()),
+        pa.field("ring_order", pa.int64()),
+        pa.field("building_id", pa.string()),
+        pa.field("building_storeys_count", pa.float64()),
+        pa.field("building_living_area", pa.float64()),
+        pa.field("building_year", pa.float64()),
+        pa.field("service_id", pa.string()),
+        pa.field("service_type_name", pa.string()),
+        pa.field("service_capacity", pa.float64()),
+        pa.field("geometry", pa.binary()),
+    ]
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -248,21 +282,74 @@ def _query_tree_records(tree: Optional[STRtree], lookup: Dict[int, object], fall
     return results
 
 
-def _write_parquet_chunk(writer: Optional[pq.ParquetWriter], path: Path, records: Sequence[Dict[str, object]]) -> Optional[pq.ParquetWriter]:
+def _coerce_dataframe_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
+    df = df.copy()
+    for field in schema:
+        name = field.name
+        if name not in df.columns:
+            if pa_types.is_integer(field.type):
+                df[name] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+            elif pa_types.is_floating(field.type):
+                df[name] = pd.Series(np.nan, index=df.index, dtype="float64")
+            elif pa_types.is_string(field.type):
+                df[name] = pd.Series(pd.NA, index=df.index, dtype="string")
+            elif pa_types.is_binary(field.type):
+                df[name] = pd.Series([None] * len(df), index=df.index, dtype="object")
+            else:
+                df[name] = pd.Series([None] * len(df), index=df.index, dtype="object")
+            continue
+
+        series = df[name]
+        if pa_types.is_integer(field.type):
+            df[name] = pd.to_numeric(series, errors="coerce").astype("Int64")
+        elif pa_types.is_floating(field.type):
+            df[name] = pd.to_numeric(series, errors="coerce").astype("float64")
+        elif pa_types.is_string(field.type):
+            df[name] = series.astype("string")
+        elif pa_types.is_binary(field.type):
+            df[name] = series.apply(_ensure_binary_value)
+
+    df = df[[field.name for field in schema]]
+    return df
+
+
+def _ensure_binary_value(value: object) -> Optional[bytes]:
+    if value is None or pd.isna(value):  # type: ignore[arg-type]
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise TypeError(f"Expected bytes-like value for binary column, got {type(value)!r}")
+
+
+def _write_parquet_chunk(
+    writer: Optional[pq.ParquetWriter],
+    path: Path,
+    records: Sequence[Dict[str, object]],
+    *,
+    schema: Optional[pa.Schema] = None,
+) -> Optional[pq.ParquetWriter]:
     if not records:
         return writer
     df = pd.DataFrame(list(records))
-    for column in ("row", "col", "ring_index", "ring_order"):
-        if column not in df.columns:
-            continue
-        series = df[column]
-        if isinstance(series.dtype, pd.Int64Dtype):
-            continue
-        if is_integer_dtype(series.dtype):
-            df[column] = series.astype("Int64")
-        else:
-            df[column] = pd.to_numeric(series, errors="coerce").astype("Int64")
-    table = pa.Table.from_pandas(df, preserve_index=False)
+    if schema is not None:
+        df = _coerce_dataframe_to_schema(df, schema)
+        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+    else:
+        for column in ("row", "col", "ring_index", "ring_order"):
+            if column not in df.columns:
+                continue
+            series = df[column]
+            if isinstance(series.dtype, pd.Int64Dtype):
+                continue
+            if is_integer_dtype(series.dtype):
+                df[column] = series.astype("Int64")
+            else:
+                df[column] = pd.to_numeric(series, errors="coerce").astype("Int64")
+        table = pa.Table.from_pandas(df, preserve_index=False)
     if writer is None:
         writer = pq.ParquetWriter(path, table.schema)
     writer.write_table(table)
@@ -800,9 +887,17 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
 
         description_record, grid_record = result
         descriptions_writer = _write_parquet_chunk(
-            descriptions_writer, descriptions_path, [description_record]
+            descriptions_writer,
+            descriptions_path,
+            [description_record],
+            schema=_DESCRIPTION_SCHEMA,
         )
-        grid_writer = _write_parquet_chunk(grid_writer, grid_path, grid_record)
+        grid_writer = _write_parquet_chunk(
+            grid_writer,
+            grid_path,
+            grid_record,
+            schema=_GRID_SCHEMA,
+        )
         zones_with_buildings += 1
 
     try:
