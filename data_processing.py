@@ -25,9 +25,8 @@ import random
 from collections import defaultdict, deque
 import logging
 import multiprocessing
-import queue
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -740,8 +739,10 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     return description_record, grid_records
 
-def _process_zone_with_globals(zone_row
-                               ) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
+
+def _process_zone_with_globals(
+    zone_row,
+) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
     if _GLOBAL_BUILDINGS is None or _GLOBAL_SERVICES is None:
         raise RuntimeError("Worker is not initialised with shared data")
 
@@ -752,156 +753,6 @@ def _process_zone_with_globals(zone_row
         _GLOBAL_GRID_SIZE,
         _GLOBAL_ZONE_TIMEOUT,
     )
-
-
-def _zone_process_entry(
-    args_queue: "multiprocessing.queues.Queue",
-    result_queue: "multiprocessing.queues.Queue",
-    buildings_df: gpd.GeoDataFrame,
-    services_df: gpd.GeoDataFrame,
-    grid_size: float,
-    zone_timeout: Optional[float],
-) -> None:
-    try:
-        payload = args_queue.get()
-    except Exception:
-        return
-
-    if payload is None:
-        return
-
-    task_id = payload.get("task_id")
-    zone_row = payload.get("zone")
-
-    try:
-        result = _process_zone(
-            zone_row,
-            buildings_df,
-            services_df,
-            grid_size,
-            zone_timeout,
-        )
-    except ZoneTimeoutError as exc:
-        try:
-            result_queue.put(("error", task_id, {"type": "timeout", "message": str(exc)}))
-        except Exception:
-            pass
-    except ZoneProcessingError as exc:
-        try:
-            result_queue.put(("error", task_id, {"type": "processing_error", "reason": exc.reason, "message": str(exc)}))
-        except Exception:
-            pass
-    except Exception as exc:
-        try:
-            result_queue.put(("error", task_id, {"type": "unexpected_error", "message": str(exc)}))
-        except Exception:
-            pass
-    else:
-        try:
-            result_queue.put(("result", task_id, result))
-        except Exception:
-            pass
-
-
-def _run_zone_task_in_process(
-    ctx: multiprocessing.context.BaseContext,
-    task_id: int,
-    zone_row,
-    buildings_df: gpd.GeoDataFrame,
-    services_df: gpd.GeoDataFrame,
-    grid_size: float,
-    zone_timeout: Optional[float],
-) -> Tuple[Optional[Tuple[Dict[str, object], List[Dict[str, object]]]], Optional[Dict[str, object]]]:
-    args_queue = ctx.Queue()
-    result_queue = ctx.Queue()
-    process = ctx.Process(
-        target=_zone_process_entry,
-        args=(args_queue, result_queue, buildings_df, services_df, grid_size, zone_timeout),
-    )
-    process.start()
-
-    try:
-        args_queue.put({"task_id": task_id, "zone": zone_row})
-        args_queue.close()
-        args_queue.join_thread()
-
-        result: Optional[Tuple[Dict[str, object], List[Dict[str, object]]]] = None
-        error_info: Optional[Dict[str, object]] = None
-
-        start_time = monotonic()
-        grace = 0.5
-        if zone_timeout is not None and zone_timeout > 0:
-            grace = max(0.5, zone_timeout * 0.05)
-            join_deadline = start_time + zone_timeout + grace
-        else:
-            join_deadline = None
-
-        timed_out = False
-
-        while True:
-            timeout: Optional[float]
-            if join_deadline is None:
-                timeout = None
-            else:
-                remaining = join_deadline - monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                timeout = min(0.5, remaining)
-
-            try:
-                message = result_queue.get(timeout=timeout)
-            except queue.Empty:
-                continue
-
-            msg_type, msg_task_id, payload = message
-            if msg_type == "result":
-                result = payload
-                break
-            elif msg_type == "error":
-                error_info = payload
-                break
-
-        if timed_out:
-            error_info = {"type": "timeout", "message": None}
-
-        # Ensure process termination and drain any remaining messages.
-        if timed_out:
-            if process.is_alive():
-                process.terminate()
-                process.join()
-        else:
-            process.join(timeout=grace)
-            if process.is_alive():
-                process.terminate()
-                process.join()
-
-        while True:
-            try:
-                message = result_queue.get_nowait()
-            except queue.Empty:
-                break
-            msg_type, msg_task_id, payload = message
-            if msg_type == "result" and result is None:
-                result = payload
-            elif msg_type == "error" and error_info is None:
-                error_info = payload
-
-        if result is None and error_info is None:
-            error_info = {"type": "unexpected_error", "message": "Worker exited without result"}
-
-        return result, error_info
-    finally:
-        try:
-            result_queue.close()
-            result_queue.join_thread()
-        except Exception:
-            pass
-        try:
-            args_queue.close()
-            args_queue.join_thread()
-        except Exception:
-            pass
 
 
 def process(zones_path: Path, buildings_path: Path, services_path: Path, output_dir: Path,
@@ -958,42 +809,92 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
         effective_workers = max(1, workers)
         if effective_workers > 1 and total_zones > 0:
             ctx = multiprocessing.get_context("spawn")
-            with ThreadPoolExecutor(max_workers=min(effective_workers, total_zones)) as executor:
-                pending: Dict[Future, Tuple[int, object]] = {}
-                task_iter = iter(enumerate(tasks))
+            pool_workers = min(effective_workers, total_zones)
+            pool_kwargs = dict(
+                max_workers=pool_workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(buildings, services, grid_size, zone_timeout),
+            )
 
-                def submit_next() -> None:
-                    try:
-                        next_idx, next_zone = next(task_iter)
-                    except StopIteration:
-                        return
-                    future = executor.submit(
-                        _run_zone_task_in_process,
-                        ctx,
-                        next_idx,
-                        next_zone,
-                        buildings,
-                        services,
-                        grid_size,
-                        zone_timeout,
-                    )
-                    pending[future] = (next_idx, next_zone)
+            hard_timeout: Optional[float] = None
+            if zone_timeout is not None and zone_timeout > 0:
+                hard_timeout = zone_timeout + max(0.5, zone_timeout * 0.05)
 
-                for _ in range(min(effective_workers, total_zones)):
-                    submit_next()
+            remaining_tasks: deque = deque(tasks)
+            future_to_zone: Dict[object, Tuple[object, float]] = {}
 
-                while pending:
-                    future = next(as_completed(list(pending.keys())))
-                    idx, zone_row = pending.pop(future)
-                    try:
-                        result, error_info = future.result()
-                    except Exception as exc:  # pragma: no cover - defensive guard
-                        LOGGER.exception("Zone worker thread failed")
-                        result = None
-                        error_info = {"type": "unexpected_error", "message": str(exc)}
-                    handle_outcome(zone_row, result, error_info)
-                    progress_tracker.update()
-                    submit_next()
+            executor = ProcessPoolExecutor(**pool_kwargs)
+            try:
+                def submit_next() -> bool:
+                    if not remaining_tasks:
+                        return False
+                    zone_row = remaining_tasks.popleft()
+                    future = executor.submit(_process_zone_with_globals, zone_row)
+                    future_to_zone[future] = (zone_row, monotonic())
+                    return True
+
+                while len(future_to_zone) < pool_workers and submit_next():
+                    pass
+
+                while future_to_zone:
+                    done, _ = wait(list(future_to_zone.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                    if not done:
+                        if hard_timeout is not None:
+                            now = monotonic()
+                            timed_out_future = None
+                            for future, (zone_row, start_time) in future_to_zone.items():
+                                if now - start_time > hard_timeout:
+                                    timed_out_future = future
+                                    break
+                            if timed_out_future is not None:
+                                zone_row, _ = future_to_zone.pop(timed_out_future)
+                                message: Optional[str] = None
+                                if zone_timeout is not None and zone_timeout > 0:
+                                    message = f"Hard timeout after {zone_timeout:.2f} seconds"
+                                handle_outcome(zone_row, None, {"type": "timeout", "message": message})
+                                progress_tracker.update()
+
+                                if future_to_zone:
+                                    pending_zones = [info[0] for info in future_to_zone.values()]
+                                else:
+                                    pending_zones = []
+                                future_to_zone.clear()
+                                if pending_zones:
+                                    for pending_zone in reversed(pending_zones):
+                                        remaining_tasks.appendleft(pending_zone)
+
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                executor = ProcessPoolExecutor(**pool_kwargs)
+
+                                while len(future_to_zone) < pool_workers and submit_next():
+                                    pass
+                                continue
+                        continue
+
+                    for future in done:
+                        zone_row, _ = future_to_zone.pop(future)
+                        try:
+                            result = future.result()
+                            error_info: Optional[Dict[str, object]] = None
+                        except ZoneTimeoutError as exc:
+                            result = None
+                            error_info = {"type": "timeout", "message": str(exc)}
+                        except ZoneProcessingError as exc:
+                            result = None
+                            error_info = {"type": "processing_error", "reason": exc.reason, "message": str(exc)}
+                        except Exception as exc:  # pragma: no cover - defensive guard
+                            LOGGER.exception("Zone processing failed")
+                            result = None
+                            error_info = {"type": "unexpected_error", "message": str(exc)}
+
+                        handle_outcome(zone_row, result, error_info)
+                        progress_tracker.update()
+
+                        while len(future_to_zone) < pool_workers and submit_next():
+                            pass
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
         else:
             for zone_row in tasks:
                 result: Optional[Tuple[Dict[str, object], List[Dict[str, object]]]] = None
@@ -1005,7 +906,7 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                         grid_size,
                         zone_timeout,
                     )
-                    error_info: Optional[Dict[str, object]] = None
+                    error_info = None
                 except ZoneTimeoutError as exc:
                     error_info = {"type": "timeout", "message": str(exc)}
                 except ZoneProcessingError as exc:
