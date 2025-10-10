@@ -187,10 +187,6 @@ class AutoregressiveTransformer(nn.Module):
         self.edge_bias_scale = nn.Parameter(torch.tensor(1.0))
 
     @property
-    def num_prompt_tokens(self) -> int:
-        return 3
-
-    @property
     def num_edge_tokens(self) -> int:
         return len(EDGE_TOKENS)
 
@@ -198,12 +194,13 @@ class AutoregressiveTransformer(nn.Module):
         self,
         edge_distances: torch.Tensor,
         seq_mask: torch.Tensor,
+        prompt_tokens: int,
         device: torch.device,
     ) -> torch.Tensor:
         batch, seq_len, _ = edge_distances.size()
-        total_len = self.num_prompt_tokens + self.num_edge_tokens + seq_len
+        total_len = prompt_tokens + self.num_edge_tokens + seq_len
         bias = torch.zeros(batch, total_len, total_len, device=device)
-        prefix = self.num_prompt_tokens
+        prefix = prompt_tokens
         for b in range(batch):
             length = int(seq_mask[b].sum().item())
             for i in range(length):
@@ -214,10 +211,15 @@ class AutoregressiveTransformer(nn.Module):
                 )
         return bias
 
-    def build_attention_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        total_len = self.num_prompt_tokens + self.num_edge_tokens + seq_len
+    def build_attention_mask(
+        self,
+        seq_len: int,
+        prompt_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        total_len = prompt_tokens + self.num_edge_tokens + seq_len
         mask = torch.zeros(total_len, total_len, device=device)
-        prefix = self.num_prompt_tokens + self.num_edge_tokens
+        prefix = prompt_tokens + self.num_edge_tokens
         for i in range(prefix, total_len):
             mask[i, i + 1 :] = float("-inf")
         return mask
@@ -253,10 +255,11 @@ class AutoregressiveTransformer(nn.Module):
 
         x = torch.cat([prompts, edge_tokens, cell_emb], dim=1)
 
-        attn_mask = self.build_attention_mask(seq_len, device)
-        bias = self.build_attention_bias(edge_distances, sequence_mask, device)
+        prompt_tokens = prompts.size(1)
+        attn_mask = self.build_attention_mask(seq_len, prompt_tokens, device)
+        bias = self.build_attention_bias(edge_distances, sequence_mask, prompt_tokens, device)
         key_padding_mask = torch.zeros(batch, x.size(1), dtype=torch.bool, device=device)
-        prefix = self.num_prompt_tokens + self.num_edge_tokens
+        prefix = prompt_tokens + self.num_edge_tokens
         pad = ~(sequence_mask.bool())
         key_padding_mask[:, prefix : prefix + seq_len] = pad
 
