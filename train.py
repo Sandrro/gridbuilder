@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import random
 from pathlib import Path
@@ -13,6 +14,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 from data.dataset import EDGE_TOKENS, GridDataset, collate_zone_batch
 from models.transformer import AutoregressiveTransformer, ModelConfig
@@ -204,7 +206,8 @@ def train_one_epoch(
 ) -> int:
     model.train()
     logger = metrics_utils.MetricsLogger()
-    for step, batch in enumerate(loader):
+    progress = tqdm(loader, desc=f"Train {epoch}", leave=False, total=len(loader))
+    for step, batch in enumerate(progress):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         with torch.cuda.amp.autocast(enabled=args.fp16):
             outputs = model(
@@ -232,7 +235,9 @@ def train_one_epoch(
         if (step + 1) % args.log_every == 0:
             averages = logger.to_dict()
             log_items = " ".join(f"{k}={v:.4f}" for k, v in sorted(averages.items()))
-            print(f"Epoch {epoch} step {step+1}: {log_items}")
+            logging.info("Epoch %s step %s: %s", epoch, step + 1, log_items)
+            display_items = list(sorted(averages.items()))[:3]
+            progress.set_postfix({k.split('/')[-1]: f"{v:.3f}" for k, v in display_items})
             logger = metrics_utils.MetricsLogger()
     return global_step
 
@@ -246,7 +251,8 @@ def evaluate(
     model.eval()
     logger = metrics_utils.MetricsLogger()
     with torch.no_grad():
-        for batch in loader:
+        progress = tqdm(loader, desc="Eval", leave=False, total=len(loader))
+        for batch in progress:
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             outputs = model(
                 batch["cell_class"],
@@ -262,12 +268,14 @@ def evaluate(
             logger.update("loss/total", float(loss.item()))
             for key, value in metrics.items():
                 logger.update(f"val_{key}", value)
+            progress.set_postfix({"loss": f"{float(loss.item()):.3f}"})
     return logger.to_dict()
 
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     set_seed(args.seed)
 
     out_dir = ensure_dir(args.out_dir)
@@ -280,6 +288,12 @@ def main() -> None:
     )
 
     train_indices, val_indices = stratified_split(dataset, args.val_split, args.seed)
+    logging.info(
+        "Dataset prepared with %d zones (%d train / %d val)",
+        len(dataset),
+        len(train_indices),
+        len(val_indices),
+    )
     train_loader = DataLoader(
         Subset(dataset, train_indices),
         batch_size=args.batch_size,
@@ -294,6 +308,7 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info("Using device: %s", device)
 
     config = ModelConfig(
         d_model=args.d_model,
@@ -314,6 +329,7 @@ def main() -> None:
     total_steps = max(len(train_loader) * args.epochs, 1)
     global_step = 0
     for epoch in range(1, args.epochs + 1):
+        logging.info("Starting epoch %d / %d", epoch, args.epochs)
         global_step = train_one_epoch(
             model,
             train_loader,
@@ -329,11 +345,13 @@ def main() -> None:
         metrics = evaluate(model, val_loader, dataset, device)
         if metrics:
             log_items = " ".join(f"{k}={v:.4f}" for k, v in sorted(metrics.items()))
-            print(f"Epoch {epoch} validation: {log_items}")
+            logging.info("Epoch %s validation: %s", epoch, log_items)
         if epoch % args.save_every == 0:
             save_checkpoint(model, optimizer, epoch, out_dir)
+            logging.info("Checkpoint saved for epoch %d", epoch)
 
     torch.save(model.state_dict(), out_dir / "model.pt")
+    logging.info("Final model checkpoint saved to %s", out_dir / "model.pt")
 
     vocab = {
         "service_types": dataset.service_types,
@@ -341,6 +359,7 @@ def main() -> None:
         "edge_tokens": EDGE_TOKENS,
     }
     save_json(vocab, out_dir / "vocab.json")
+    logging.info("Vocabulary saved with %d service types and %d zone types", len(dataset.service_types), len(dataset.zone_type_to_id))
 
     norm_stats = {
         "living_mean": dataset.living_mean,
@@ -350,6 +369,7 @@ def main() -> None:
         "cell_size_m": args.cell_size,
     }
     save_json(norm_stats, out_dir / "norm_stats.json")
+    logging.info("Normalization statistics saved to %s", out_dir / "norm_stats.json")
 
     inference_config = {
         "model": {
@@ -364,6 +384,7 @@ def main() -> None:
         "cell_size": args.cell_size,
     }
     save_json(inference_config, out_dir / "inference_config.json")
+    logging.info("Inference configuration saved to %s", out_dir / "inference_config.json")
 
 
 if __name__ == "__main__":
