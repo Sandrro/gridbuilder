@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from pandas.api.types import is_integer_dtype
 
 import geopandas as gpd
 import numpy as np
@@ -156,6 +157,16 @@ def _write_parquet_chunk(writer: Optional[pq.ParquetWriter], path: Path, records
     if not records:
         return writer
     df = pd.DataFrame(list(records))
+    for column in ("row", "col", "ring_index", "ring_order"):
+        if column not in df.columns:
+            continue
+        series = df[column]
+        if isinstance(series.dtype, pd.Int64Dtype):
+            continue
+        if is_integer_dtype(series.dtype):
+            df[column] = series.astype("Int64")
+        else:
+            df[column] = pd.to_numeric(series, errors="coerce").astype("Int64")
     table = pa.Table.from_pandas(df, preserve_index=False)
     if writer is None:
         writer = pq.ParquetWriter(path, table.schema)
