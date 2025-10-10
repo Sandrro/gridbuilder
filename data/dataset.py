@@ -220,7 +220,8 @@ class GridDataset(Dataset):
         is_living_mask = building_present.astype(np.float32)
         living_area_mask = building_present.astype(np.float32)
         storeys = group["building_storeys_count"].fillna(0.0).to_numpy(dtype=np.float32)
-        storeys_mask = (~group["building_storeys_count"].isna() & building_present).astype(np.float32)
+        storeys_available = group["building_storeys_count"].notna().to_numpy()
+        storeys_mask = np.logical_and(storeys_available, building_present).astype(np.float32)
 
         service_type_series = group["service_type_name"].fillna("__none__")
         service_type_ids = np.full(num_cells, -1, dtype=np.int64)
