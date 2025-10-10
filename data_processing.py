@@ -23,7 +23,7 @@ import json
 import math
 import random
 from collections import defaultdict, deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -643,29 +643,50 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                 initializer=_init_worker,
                 initargs=(buildings, services, grid_size, zone_timeout),
             ) as executor:
-                future_to_zone = {
-                    executor.submit(_process_zone_with_globals, zone_row): zone_row
-                    for zone_row in tasks
-                }
-                for future in as_completed(future_to_zone):
-                    zone_row = future_to_zone.pop(future)
+                task_iter = iter(tasks)
+                future_to_zone: Dict[object, object] = {}
+
+                def submit_next() -> bool:
                     try:
-                        result = future.result()
-                    except ZoneTimeoutError:
-                        record = _make_timeout_record(zone_row)
-                        if record is not None:
-                            timeout_records.append(record)
+                         zone_row = next(task_iter)
+                    except StopIteration:
+                        return False
+                    future = executor.submit(_process_zone_with_globals, zone_row)
+                    future_to_zone[future] = zone_row
+                    return True
+
+                for _ in range(min(workers, total_zones)):
+                    if not submit_next():
+                        break
+
+                while future_to_zone:
+                    done, _ = wait(set(future_to_zone), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        zone_row = future_to_zone.pop(future)
+                        try:
+                            result = future.result()
+                        except ZoneTimeoutError:
+                            record = _make_timeout_record(zone_row)
+                            if record is not None:
+                                timeout_records.append(record)
+                            if progress_bar is not None:
+                                progress_bar.update(1)
+                            submit_next()
+                            continue
+
                         if progress_bar is not None:
                             progress_bar.update(1)
-                        continue
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-                    if result is None:
-                        continue
-                    description_record, grid_record = result
-                    descriptions_writer = _write_parquet_chunk(descriptions_writer, descriptions_path, [description_record])
-                    grid_writer = _write_parquet_chunk(grid_writer, grid_path, grid_record)
-                    zones_with_buildings += 1
+
+                        if result is None:
+                            submit_next()
+                            continue
+                        description_record, grid_record = result
+                        descriptions_writer = _write_parquet_chunk(
+                            descriptions_writer, descriptions_path, [description_record]
+                        )
+                        grid_writer = _write_parquet_chunk(grid_writer, grid_path, grid_record)
+                        zones_with_buildings += 1
+                        submit_next()
         else:
             for zone_row in tasks:
                 try:
