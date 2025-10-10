@@ -108,6 +108,7 @@ def _query_tree_records(tree: Optional[STRtree], lookup: Dict[int, object], fall
         candidates = tree.query(geom, predicate="intersects")
     except TypeError:  # Older shapely
         candidates = tree.query(geom)
+    candidates = list(candidates)
     if not candidates:
         return ()
     seen: set[int] = set()
@@ -494,17 +495,17 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
     description_record = {
         "zone_id": zone_id,
         "zone_type": getattr(zone_row, "functional_zone_type_name", None),
-        "total_living_area": None,
-        "building_coverage_ratio": coverage_area / zone_area if zone_area > 0 else None,
-        "storeys_min": storeys_min,
-        "storeys_max": storeys_max,
+        "total_living_area": np.nan,
+        "building_coverage_ratio": coverage_area / zone_area if zone_area > 0 else np.nan,
+        "storeys_min": np.nan if storeys_min is None else float(storeys_min),
+        "storeys_max": np.nan if storeys_max is None else float(storeys_max),
         "service_counts": json.dumps({k: v["count"] for k, v in service_summary.items()}, ensure_ascii=False),
         "service_capacities": json.dumps({k: v["capacity"] for k, v in service_summary.items()}, ensure_ascii=False),
     }
 
     living_values = [record.living_area_in_zone for record in building_records if record.living_area_in_zone is not None]
     if living_values:
-        description_record["total_living_area"] = sum(living_values)
+        description_record["total_living_area"] = float(sum(living_values))
 
     grid_records: List[Dict[str, object]] = []
     for idx, cell in enumerate(cells):
