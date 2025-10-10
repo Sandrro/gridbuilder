@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tools for preparing zone descriptions and uniform grids from GeoJSON inputs.
 
 The script expects three GeoJSON inputs (zones, buildings, services) and
@@ -25,13 +24,20 @@ import random
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely.geometry import box
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError as exc:  # pragma: no cover - hard failure without pyarrow
+    raise ImportError("pyarrow is required for Parquet output. Please install pyarrow.") from exc
 from shapely import wkb
+from shapely.geometry import box
+from shapely.prepared import prep
+from shapely.strtree import STRtree
 
 try:
     from tqdm import tqdm
@@ -86,7 +92,50 @@ def _hash_seed(value: object) -> int:
     return int(digest[:16], 16) % (2 ** 32)
 
 
-def _prepare_buildings(zone_geom, buildings_df: gpd.GeoDataFrame) -> Tuple[List[BuildingRecord], float, Optional[float], Optional[float]]:
+def _build_strtree(records: Iterable[object]) -> Tuple[Optional[STRtree], Dict[int, object]]:
+    geometries = [record.geometry for record in records if getattr(record, "geometry", None) is not None]
+    if not geometries:
+        return None, {}
+    tree = STRtree(geometries)
+    lookup = {id(geom): record for geom, record in zip(geometries, records)}
+    return tree, lookup
+
+
+def _query_tree_records(tree: Optional[STRtree], lookup: Dict[int, object], fallback: Sequence[object], geom) -> Sequence[object]:
+    if tree is None:
+        return fallback
+    try:
+        candidates = tree.query(geom, predicate="intersects")
+    except TypeError:  # Older shapely
+        candidates = tree.query(geom)
+    if not candidates:
+        return ()
+    seen: set[int] = set()
+    results: List[object] = []
+    for candidate in candidates:
+        record = lookup.get(id(candidate))
+        if record is None:
+            continue
+        marker = id(record)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        results.append(record)
+    return results
+
+
+def _write_parquet_chunk(writer: Optional[pq.ParquetWriter], path: Path, records: Sequence[Dict[str, object]]) -> Optional[pq.ParquetWriter]:
+    if not records:
+        return writer
+    df = pd.DataFrame(list(records))
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    if writer is None:
+        writer = pq.ParquetWriter(path, table.schema)
+    writer.write_table(table)
+    return writer
+
+
+def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame) -> Tuple[List[BuildingRecord], float, Optional[float], Optional[float]]:
     zone_bounds = zone_geom.bounds
     records: List[BuildingRecord] = []
     storeys_values: List[float] = []
@@ -98,7 +147,10 @@ def _prepare_buildings(zone_geom, buildings_df: gpd.GeoDataFrame) -> Tuple[List[
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
             continue
-        intersection = geom.intersection(zone_geom)
+        if zone_prepared.contains(geom):
+            intersection = geom
+        else:
+            intersection = geom.intersection(zone_geom)
         if intersection.is_empty:
             continue
         area_in_zone = intersection.area
@@ -148,7 +200,7 @@ def _prepare_buildings(zone_geom, buildings_df: gpd.GeoDataFrame) -> Tuple[List[
     return records, coverage_area, storeys_min, storeys_max
 
 
-def _prepare_services(zone_geom, services_df: gpd.GeoDataFrame) -> Tuple[List[ServiceRecord], Dict[str, Dict[str, float]]]:
+def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame) -> Tuple[List[ServiceRecord], Dict[str, Dict[str, float]]]:
     zone_bounds = zone_geom.bounds
     summary: Dict[str, Dict[str, float]] = {}
     records: List[ServiceRecord] = []
@@ -159,7 +211,10 @@ def _prepare_services(zone_geom, services_df: gpd.GeoDataFrame) -> Tuple[List[Se
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
             continue
-        intersection = geom.intersection(zone_geom)
+        if zone_prepared.contains(geom):
+            intersection = geom
+        else:
+            intersection = geom.intersection(zone_geom)
         if intersection.is_empty:
             continue
         service_type = getattr(service, "service_type_name", None)
@@ -292,22 +347,26 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     zone_id = getattr(zone_row, "functional_zone_id", getattr(zone_row, "id", None))
     rng = random.Random(_hash_seed(zone_id))
+    zone_prepared = prep(zone_geom)
 
     buildings_candidates = buildings_df
     if hasattr(buildings_df, "sindex") and buildings_df.sindex is not None:
         candidate_idx = buildings_df.sindex.query(zone_geom, predicate="intersects")
-        buildings_candidates = buildings_df.iloc[np.asarray(candidate_idx)].copy()
+        buildings_candidates = buildings_df.iloc[np.asarray(candidate_idx)]
 
-    building_records, coverage_area, storeys_min, storeys_max = _prepare_buildings(zone_geom, buildings_candidates)
+    building_records, coverage_area, storeys_min, storeys_max = _prepare_buildings(zone_geom, zone_prepared, buildings_candidates)
     if not building_records:
         return None
+
+    building_tree, building_lookup_by_geom = _build_strtree(building_records)
 
     services_candidates = services_df
     if hasattr(services_df, "sindex") and services_df.sindex is not None:
         candidate_idx = services_df.sindex.query(zone_geom, predicate="intersects")
-        services_candidates = services_df.iloc[np.asarray(candidate_idx)].copy()
+        services_candidates = services_df.iloc[np.asarray(candidate_idx)]
 
-    service_records, service_summary = _prepare_services(zone_geom, services_candidates)
+    service_records, service_summary = _prepare_services(zone_geom, zone_prepared, services_candidates)
+    service_tree, service_lookup_by_geom = _build_strtree(service_records)
 
     minx, miny, maxx, maxy = zone_geom.bounds
     start_x = math.floor(minx / cell_size) * cell_size
@@ -334,9 +393,12 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
             cell_geom = box(x0, y0, x1, y1)
             if not _bbox_intersects(cell_geom.bounds, zone_bounds):
                 continue
-            if not cell_geom.intersects(zone_geom):
+            if not zone_prepared.intersects(cell_geom):
                 continue
-            intersection = cell_geom.intersection(zone_geom)
+            if zone_prepared.contains(cell_geom):
+                intersection = cell_geom
+            else:
+                intersection = cell_geom.intersection(zone_geom)
             if intersection.is_empty:
                 continue
 
@@ -360,64 +422,63 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
             # Building assignment
             best_building = None
             best_coverage = 0.0
-            candidate_buildings = building_records
-            for building in candidate_buildings:
-                if not _bbox_intersects(building.bounds, cell_geom.bounds):
-                    continue
-                coverage = building.geometry.intersection(cell_geom).area
-                if coverage <= 0:
-                    continue
-                ratio = coverage / cell_area
-                if ratio > best_coverage:
-                    best_coverage = ratio
-                    best_building = building
+            if building_records:
+                candidate_buildings = _query_tree_records(building_tree, building_lookup_by_geom, building_records, cell_geom)
+                ratios: List[Tuple[BuildingRecord, float]] = []
+                for building in candidate_buildings:
+                    if not _bbox_intersects(building.bounds, cell_geom.bounds):
+                        continue
+                    coverage = building.geometry.intersection(cell_geom).area
+                    if coverage <= 0:
+                        continue
+                    ratio = coverage / cell_area if cell_area > 0 else 0.0
+                    if ratio <= 0:
+                        continue
+                    ratios.append((building, ratio))
 
-            if best_building is not None and (best_coverage > 0.5 or math.isclose(best_coverage, 0.5, rel_tol=1e-9, abs_tol=1e-9)):
-                if math.isclose(best_coverage, 0.5, rel_tol=1e-9, abs_tol=1e-9):
-                    tied = [b for b in candidate_buildings if _bbox_intersects(b.bounds, cell_geom.bounds) and math.isclose(b.geometry.intersection(cell_geom).area / cell_area, 0.5, rel_tol=1e-9, abs_tol=1e-9)]
-                    if tied:
-                        best_building = rng.choice(tied)
-                cell_record["building_id"] = best_building.building_id
+                if ratios:
+                    max_ratio = max(ratio for _, ratio in ratios)
+                    if max_ratio > 0.5 + 1e-9:
+                        top_candidates = [rec for rec, ratio in ratios if math.isclose(ratio, max_ratio, rel_tol=1e-9, abs_tol=1e-9)]
+                        best_building = rng.choice(top_candidates) if len(top_candidates) > 1 else top_candidates[0]
+                        cell_record["building_id"] = best_building.building_id
+                    elif math.isclose(max_ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9):
+                        tied_half = [rec for rec, ratio in ratios if math.isclose(ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9)]
+                        if tied_half:
+                            chosen = rng.choice(tied_half) if len(tied_half) > 1 else tied_half[0]
+                            cell_record["building_id"] = chosen.building_id
 
             # Service assignment
-            best_service = None
-            best_service_coverage = 0.0
-            for service in service_records:
-                if not _bbox_intersects(service.bounds, cell_geom.bounds):
-                    continue
-                if service.is_point:
-                    if service.geometry.geom_type == "Point":
-                        coverage_ratio = 1.0 if cell_geom.contains(service.geometry) else 0.0
-                    else:
-                        points = list(service.geometry.geoms)
-                        coverage_ratio = 1.0 if any(cell_geom.contains(pt) for pt in points) else 0.0
-                else:
-                    coverage = service.geometry.intersection(cell_geom).area
-                    coverage_ratio = coverage / cell_area if cell_area > 0 else 0.0
-                if coverage_ratio <= 0:
-                    continue
-                if coverage_ratio > best_service_coverage:
-                    best_service_coverage = coverage_ratio
-                    best_service = service
-
-            if best_service is not None and (best_service_coverage > 0.5 or math.isclose(best_service_coverage, 0.5, rel_tol=1e-9, abs_tol=1e-9)):
-                if math.isclose(best_service_coverage, 0.5, rel_tol=1e-9, abs_tol=1e-9):
-                    tied_services = []
-                    for service in service_records:
-                        if not _bbox_intersects(service.bounds, cell_geom.bounds):
-                            continue
-                        if service.is_point:
-                            if service.geometry.geom_type == "Point":
-                                ratio = 1.0 if cell_geom.contains(service.geometry) else 0.0
-                            else:
-                                ratio = 1.0 if any(cell_geom.contains(pt) for pt in service.geometry.geoms) else 0.0
+            if service_records:
+                candidate_services = _query_tree_records(service_tree, service_lookup_by_geom, service_records, cell_geom)
+                service_ratios: List[Tuple[ServiceRecord, float]] = []
+                for service in candidate_services:
+                    if not _bbox_intersects(service.bounds, cell_geom.bounds):
+                        continue
+                    if service.is_point:
+                        if service.geometry.geom_type == "Point":
+                            coverage_ratio = 1.0 if cell_geom.contains(service.geometry) else 0.0
                         else:
-                            ratio = service.geometry.intersection(cell_geom).area / cell_area if cell_area > 0 else 0.0
-                        if math.isclose(ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9):
-                            tied_services.append(service)
-                    if tied_services:
-                        best_service = rng.choice(tied_services)
-                cell_record["service_id"] = best_service.service_id
+                            points = list(service.geometry.geoms)
+                            coverage_ratio = 1.0 if any(cell_geom.contains(pt) for pt in points) else 0.0
+                    else:
+                        coverage = service.geometry.intersection(cell_geom).area
+                        coverage_ratio = coverage / cell_area if cell_area > 0 else 0.0
+                    if coverage_ratio <= 0:
+                        continue
+                    service_ratios.append((service, coverage_ratio))
+
+                if service_ratios:
+                    max_ratio = max(ratio for _, ratio in service_ratios)
+                    if max_ratio > 0.5 + 1e-9:
+                        top_candidates = [rec for rec, ratio in service_ratios if math.isclose(ratio, max_ratio, rel_tol=1e-9, abs_tol=1e-9)]
+                        best_service = rng.choice(top_candidates) if len(top_candidates) > 1 else top_candidates[0]
+                        cell_record["service_id"] = best_service.service_id
+                    elif math.isclose(max_ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9):
+                        tied_half = [rec for rec, ratio in service_ratios if math.isclose(ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9)]
+                        if tied_half:
+                            chosen_service = rng.choice(tied_half) if len(tied_half) > 1 else tied_half[0]
+                            cell_record["service_id"] = chosen_service.service_id
 
             cells.append(cell_record)
 
@@ -426,6 +487,9 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     _assign_ring_order(cells, zone_geom)
     _distribute_values(cells, building_lookup, service_lookup)
+
+    for cell in cells:
+        cell.pop("intersection", None)
 
     description_record = {
         "zone_id": zone_id,
@@ -444,6 +508,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     grid_records: List[Dict[str, object]] = []
     for idx, cell in enumerate(cells):
+        geometry_bytes = wkb.dumps(cell["geometry"])
         grid_records.append(
             {
                 "zone_id": zone_id,
@@ -459,7 +524,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                 "service_id": cell.get("service_id"),
                 "service_type_name": cell.get("service_type_name"),
                 "service_capacity": cell.get("service_capacity"),
-                "geometry": wkb.dumps(cell["geometry"]),
+                "geometry": geometry_bytes,
             }
         )
 
@@ -479,14 +544,18 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = list(zones.itertuples())
-    description_records: List[Dict[str, object]] = []
-    grid_records: List[Dict[str, object]] = []
+    tasks = list(zones.itertuples(index=False))
 
     progress_bar = None
     total_zones = len(tasks)
     if tqdm is not None and total_zones:
         progress_bar = tqdm(total=total_zones, desc="Zones", unit="zone")
+
+    descriptions_path = output_dir / "descriptions.parquet"
+    grid_path = output_dir / "grid_cells.parquet"
+    descriptions_writer: Optional[pq.ParquetWriter] = None
+    grid_writer: Optional[pq.ParquetWriter] = None
+    zones_with_buildings = 0
 
     try:
         if workers > 1:
@@ -504,8 +573,9 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                     if result is None:
                         continue
                     description_record, grid_record = result
-                    description_records.append(description_record)
-                    grid_records.extend(grid_record)
+                    descriptions_writer = _write_parquet_chunk(descriptions_writer, descriptions_path, [description_record])
+                    grid_writer = _write_parquet_chunk(grid_writer, grid_path, grid_record)
+                    zones_with_buildings += 1
         else:
             for zone_row in tasks:
                 result = _process_zone(zone_row, buildings, services, grid_size)
@@ -514,23 +584,20 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                 if result is None:
                     continue
                 description_record, grid_record = result
-                description_records.append(description_record)
-                grid_records.extend(grid_record)
+                descriptions_writer = _write_parquet_chunk(descriptions_writer, descriptions_path, [description_record])
+                grid_writer = _write_parquet_chunk(grid_writer, grid_path, grid_record)
+                zones_with_buildings += 1
     finally:
         if progress_bar is not None:
             progress_bar.close()
 
-    if not description_records:
+    if zones_with_buildings == 0:
         raise RuntimeError("No zones contained buildings – nothing to write")
 
-    descriptions_df = pd.DataFrame(description_records)
-    grid_df = pd.DataFrame(grid_records)
-
-    descriptions_path = output_dir / "descriptions.parquet"
-    grid_path = output_dir / "grid_cells.parquet"
-
-    descriptions_df.to_parquet(descriptions_path, index=False)
-    grid_df.to_parquet(grid_path, index=False)
+    if descriptions_writer is not None:
+        descriptions_writer.close()
+    if grid_writer is not None:
+        grid_writer.close()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
