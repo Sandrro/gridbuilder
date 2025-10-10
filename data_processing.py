@@ -27,11 +27,11 @@ import logging
 import multiprocessing
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from pandas.api.types import is_integer_dtype
 
 import geopandas as gpd
@@ -87,61 +87,40 @@ _GLOBAL_ZONE_TIMEOUT: Optional[float] = None
 LOGGER = logging.getLogger(__name__)
 
 
-_STAGE_DEFINITIONS: List[Tuple[str, str]] = [
-    ("geometry", "Исправление геометрий"),
-    ("buildings", "Пространственная работа со зданиями"),
-    ("services", "Пространственная работа с сервисами"),
-]
-
-
-@dataclass
-class _StageState:
-    key: str
-    label: str
-    total: int
-    progress_bar: Optional["tqdm"]
-    count: int = 0
-    finished: bool = False
-
-
-class _StageManager:
+class _ProgressTracker:
     def __init__(self, total: int):
         self._lock = threading.Lock()
-        self._states: Dict[str, _StageState] = {}
         self._total = total
+        self._count = 0
+        self._bar: Optional["tqdm"] = None
+        self._closed = False
 
-        for idx, (key, label) in enumerate(_STAGE_DEFINITIONS):
-            bar: Optional["tqdm"] = None
-            if tqdm is not None and total > 0:
-                bar = tqdm(total=total, desc=label, unit="zone", position=idx)
-            self._states[key] = _StageState(key=key, label=label, total=total, progress_bar=bar)
-            LOGGER.info("Начало этапа: %s", label)
+        if tqdm is not None and total > 0:
+            self._bar = tqdm(total=total, desc="Обработка зон", unit="zone")
+        if total > 0:
+            LOGGER.info("Запуск обработки %s зон", total)
 
-    def update(self, stage: str) -> None:
-        state = self._states.get(stage)
-        if state is None:
-            return
+    def update(self) -> None:
         with self._lock:
-            if state.finished:
-                return
-            state.count += 1
-            if state.progress_bar is not None:
-                state.progress_bar.update(1)
-            if state.total > 0 and state.count >= state.total:
-                self._finish_state(state)
+            self._count += 1
+            if self._bar is not None:
+                self._bar.update(1)
+            if self._total > 0 and self._count >= self._total:
+                self._finalize_locked()
 
-    def _finish_state(self, state: _StageState) -> None:
-        if state.finished:
-            return
-        if state.progress_bar is not None:
-            state.progress_bar.close()
-        LOGGER.info("Завершение этапа: %s", state.label)
-        state.finished = True
-
-    def close_all(self) -> None:
+    def close(self) -> None:
         with self._lock:
-            for state in self._states.values():
-                self._finish_state(state)
+            self._finalize_locked()
+
+    def _finalize_locked(self) -> None:
+        if self._closed:
+            return
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+        if self._total > 0 and self._count >= self._total:
+            LOGGER.info("Обработка зон завершена")
+        self._closed = True
 
 
 class ZoneTimeoutError(RuntimeError):
@@ -530,8 +509,7 @@ def _make_timeout_record(zone_row, *, reason: str = "timeout", message: Optional
 
 
 def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame,
-                  cell_size: float, zone_timeout: Optional[float],
-                  stage_reporter: Optional[Callable[[str], None]] = None
+                  cell_size: float, zone_timeout: Optional[float]
                   ) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
     deadline = None
     if zone_timeout is not None and zone_timeout > 0:
@@ -540,32 +518,21 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
     _check_deadline(deadline)
     zone_geom_original = _get_zone_value(zone_row, "geometry")
     if zone_geom_original is None or zone_geom_original.is_empty:
-        if stage_reporter is not None:
-            stage_reporter("geometry")
         return None
 
     _check_deadline(deadline)
     zone_geom = _ensure_valid_geometry(zone_geom_original)
     if zone_geom is None or zone_geom.is_empty:
-        if stage_reporter is not None:
-            stage_reporter("geometry")
         raise ZoneProcessingError("invalid_geometry", "Zone geometry is invalid and could not be repaired")
 
     try:
         zone_prepared = prep(zone_geom)
     except GEOSException as exc:
-        if stage_reporter is not None:
-            stage_reporter("geometry")
         raise ZoneProcessingError("invalid_geometry", f"Failed to prepare zone geometry: {exc}") from exc
 
     zone_area = zone_geom.area
     if zone_area <= 0:
-        if stage_reporter is not None:
-            stage_reporter("geometry")
         return None
-
-    if stage_reporter is not None:
-        stage_reporter("geometry")
 
     zone_id = _get_zone_value(zone_row, "functional_zone_id")
     if zone_id is None:
@@ -578,13 +545,9 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
         buildings_candidates = buildings_df.iloc[np.asarray(candidate_idx)]
 
     _check_deadline(deadline)
-    try:
-        building_records, coverage_area, storeys_min, storeys_max = _prepare_buildings(
-            zone_geom, zone_prepared, buildings_candidates, deadline
-        )
-    finally:
-        if stage_reporter is not None:
-            stage_reporter("buildings")
+    building_records, coverage_area, storeys_min, storeys_max = _prepare_buildings(
+        zone_geom, zone_prepared, buildings_candidates, deadline
+    )
     if not building_records:
         return None
 
@@ -596,11 +559,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
         services_candidates = services_df.iloc[np.asarray(candidate_idx)]
 
     _check_deadline(deadline)
-    try:
-        service_records, service_summary = _prepare_services(zone_geom, zone_prepared, services_candidates, deadline)
-    finally:
-        if stage_reporter is not None:
-            stage_reporter("services")
+    service_records, service_summary = _prepare_services(zone_geom, zone_prepared, services_candidates, deadline)
     service_tree, service_lookup_by_geom = _build_strtree(service_records)
 
     minx, miny, maxx, maxy = zone_geom.bounds
@@ -781,7 +740,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     return description_record, grid_records
 
-def _process_zone_with_globals(zone_row, stage_reporter: Optional[Callable[[str], None]] = None
+def _process_zone_with_globals(zone_row
                                ) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
     if _GLOBAL_BUILDINGS is None or _GLOBAL_SERVICES is None:
         raise RuntimeError("Worker is not initialised with shared data")
@@ -792,7 +751,6 @@ def _process_zone_with_globals(zone_row, stage_reporter: Optional[Callable[[str]
         _GLOBAL_SERVICES,
         _GLOBAL_GRID_SIZE,
         _GLOBAL_ZONE_TIMEOUT,
-        stage_reporter=stage_reporter,
     )
 
 
@@ -815,12 +773,6 @@ def _zone_process_entry(
     task_id = payload.get("task_id")
     zone_row = payload.get("zone")
 
-    def report_stage(stage: str) -> None:
-        try:
-            result_queue.put(("stage", task_id, stage))
-        except Exception:
-            pass
-
     try:
         result = _process_zone(
             zone_row,
@@ -828,7 +780,6 @@ def _zone_process_entry(
             services_df,
             grid_size,
             zone_timeout,
-            stage_reporter=report_stage,
         )
     except ZoneTimeoutError as exc:
         try:
@@ -860,7 +811,6 @@ def _run_zone_task_in_process(
     services_df: gpd.GeoDataFrame,
     grid_size: float,
     zone_timeout: Optional[float],
-    stage_manager: _StageManager,
 ) -> Tuple[Optional[Tuple[Dict[str, object], List[Dict[str, object]]]], Optional[Dict[str, object]]]:
     args_queue = ctx.Queue()
     result_queue = ctx.Queue()
@@ -875,7 +825,6 @@ def _run_zone_task_in_process(
         args_queue.close()
         args_queue.join_thread()
 
-        reported_stages: set[str] = set()
         result: Optional[Tuple[Dict[str, object], List[Dict[str, object]]]] = None
         error_info: Optional[Dict[str, object]] = None
 
@@ -906,12 +855,7 @@ def _run_zone_task_in_process(
                 continue
 
             msg_type, msg_task_id, payload = message
-            if msg_type == "stage":
-                stage_name = payload
-                if stage_name not in reported_stages:
-                    stage_manager.update(stage_name)
-                    reported_stages.add(stage_name)
-            elif msg_type == "result":
+            if msg_type == "result":
                 result = payload
                 break
             elif msg_type == "error":
@@ -938,12 +882,7 @@ def _run_zone_task_in_process(
             except queue.Empty:
                 break
             msg_type, msg_task_id, payload = message
-            if msg_type == "stage":
-                stage_name = payload
-                if stage_name not in reported_stages:
-                    stage_manager.update(stage_name)
-                    reported_stages.add(stage_name)
-            elif msg_type == "result" and result is None:
+            if msg_type == "result" and result is None:
                 result = payload
             elif msg_type == "error" and error_info is None:
                 error_info = payload
@@ -980,7 +919,7 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
 
     tasks = list(zones.to_dict("records"))
     total_zones = len(tasks)
-    stage_manager = _StageManager(total_zones)
+    progress_tracker = _ProgressTracker(total_zones)
 
     descriptions_path = output_dir / "descriptions.parquet"
     grid_path = output_dir / "grid_cells.parquet"
@@ -1020,23 +959,32 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
         if effective_workers > 1 and total_zones > 0:
             ctx = multiprocessing.get_context("spawn")
             with ThreadPoolExecutor(max_workers=min(effective_workers, total_zones)) as executor:
-                future_to_zone = {
-                    executor.submit(
+                pending: Dict[Future, Tuple[int, object]] = {}
+                task_iter = iter(enumerate(tasks))
+
+                def submit_next() -> None:
+                    try:
+                        next_idx, next_zone = next(task_iter)
+                    except StopIteration:
+                        return
+                    future = executor.submit(
                         _run_zone_task_in_process,
                         ctx,
-                        idx,
-                        zone_row,
+                        next_idx,
+                        next_zone,
                         buildings,
                         services,
                         grid_size,
                         zone_timeout,
-                        stage_manager,
-                    ): zone_row
-                    for idx, zone_row in enumerate(tasks)
-                }
+                    )
+                    pending[future] = (next_idx, next_zone)
 
-                for future in as_completed(future_to_zone):
-                    zone_row = future_to_zone[future]
+                for _ in range(min(effective_workers, total_zones)):
+                    submit_next()
+
+                while pending:
+                    future = next(as_completed(list(pending.keys())))
+                    idx, zone_row = pending.pop(future)
                     try:
                         result, error_info = future.result()
                     except Exception as exc:  # pragma: no cover - defensive guard
@@ -1044,10 +992,9 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                         result = None
                         error_info = {"type": "unexpected_error", "message": str(exc)}
                     handle_outcome(zone_row, result, error_info)
+                    progress_tracker.update()
+                    submit_next()
         else:
-            def report_stage(stage: str) -> None:
-                stage_manager.update(stage)
-
             for zone_row in tasks:
                 result: Optional[Tuple[Dict[str, object], List[Dict[str, object]]]] = None
                 try:
@@ -1057,7 +1004,6 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                         services,
                         grid_size,
                         zone_timeout,
-                        stage_reporter=report_stage,
                     )
                     error_info: Optional[Dict[str, object]] = None
                 except ZoneTimeoutError as exc:
@@ -1069,8 +1015,9 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                     error_info = {"type": "unexpected_error", "message": str(exc)}
                     result = None
                 handle_outcome(zone_row, result, error_info)
+                progress_tracker.update()
     finally:
-        stage_manager.close_all()
+        progress_tracker.close()
 
     if zones_with_buildings == 0:
         raise RuntimeError("No zones contained buildings – nothing to write")
