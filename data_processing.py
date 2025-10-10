@@ -349,9 +349,14 @@ def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[obj
                 for idx in idxs:
                     cells[idx]["service_capacity"] = share
 
+def _get_zone_value(zone_row, attribute: str, default=None):
+    if isinstance(zone_row, dict):
+        return zone_row.get(attribute, default)
+    return getattr(zone_row, attribute, default)
+
 
 def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame, cell_size: float) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
-    zone_geom = zone_row.geometry
+    zone_geom = _get_zone_value(zone_row, "geometry")
     if zone_geom is None or zone_geom.is_empty:
         return None
 
@@ -359,7 +364,9 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
     if zone_area <= 0:
         return None
 
-    zone_id = getattr(zone_row, "functional_zone_id", getattr(zone_row, "id", None))
+    zone_id = _get_zone_value(zone_row, "functional_zone_id")
+    if zone_id is None:
+        zone_id = _get_zone_value(zone_row, "id")
     rng = random.Random(_hash_seed(zone_id))
     zone_prepared = prep(zone_geom)
 
@@ -507,7 +514,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     description_record = {
         "zone_id": zone_id,
-        "zone_type": getattr(zone_row, "functional_zone_type_name", None),
+        "zone_type": _get_zone_value(zone_row, "functional_zone_type_name"),
         "total_living_area": np.nan,
         "building_coverage_ratio": coverage_area / zone_area if zone_area > 0 else np.nan,
         "storeys_min": np.nan if storeys_min is None else float(storeys_min),
@@ -564,7 +571,7 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = list(zones.itertuples(index=False))
+    tasks = list(zones.to_dict("records"))
 
     progress_bar = None
     total_zones = len(tasks)
