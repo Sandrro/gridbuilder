@@ -22,6 +22,7 @@ import json
 import math
 import random
 from collections import defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -63,6 +64,18 @@ class ServiceRecord:
     is_point: bool
     service_type: Optional[str]
     capacity: Optional[float]
+
+_GLOBAL_BUILDINGS: Optional[gpd.GeoDataFrame] = None
+_GLOBAL_SERVICES: Optional[gpd.GeoDataFrame] = None
+_GLOBAL_GRID_SIZE: float = 0.0
+
+
+def _init_worker(buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame, grid_size: float) -> None:
+    global _GLOBAL_BUILDINGS, _GLOBAL_SERVICES, _GLOBAL_GRID_SIZE
+
+    _GLOBAL_BUILDINGS = buildings_df
+    _GLOBAL_SERVICES = services_df
+    _GLOBAL_GRID_SIZE = grid_size
 
 
 def _ensure_crs(gdf: gpd.GeoDataFrame, target_crs: str) -> gpd.GeoDataFrame:
@@ -531,6 +544,12 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
 
     return description_record, grid_records
 
+def _process_zone_with_globals(zone_row) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
+    if _GLOBAL_BUILDINGS is None or _GLOBAL_SERVICES is None:
+        raise RuntimeError("Worker is not initialised with shared data")
+
+    return _process_zone(zone_row, _GLOBAL_BUILDINGS, _GLOBAL_SERVICES, _GLOBAL_GRID_SIZE)
+
 
 def process(zones_path: Path, buildings_path: Path, services_path: Path, output_dir: Path,
             grid_size: float = 15.0, workers: int = 1) -> None:
@@ -560,11 +579,13 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
 
     try:
         if workers > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            with ThreadPoolExecutor(max_workers=workers) as executor:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_worker,
+                initargs=(buildings, services, grid_size),
+            ) as executor:
                 futures = [
-                    executor.submit(_process_zone, zone_row, buildings, services, grid_size)
+                    executor.submit(_process_zone_with_globals, zone_row)
                     for zone_row in tasks
                 ]
                 for future in as_completed(futures):
@@ -608,7 +629,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("services", type=Path, help="Path to services GeoJSON file")
     parser.add_argument("output_dir", type=Path, help="Directory where Parquet outputs will be stored")
     parser.add_argument("--grid-size", type=float, default=15.0, help="Grid cell size in metres (default: 15)")
-    parser.add_argument("--workers", type=int, default=1, help="Number of worker threads for zone processing")
+    parser.add_argument("--workers", type=int, default=1, help="Number of worker processes for zone processing")
     return parser
 
 
