@@ -42,6 +42,11 @@ from shapely import wkb
 from shapely.geometry import box
 from shapely.prepared import prep
 from shapely.strtree import STRtree
+from shapely.ops import unary_union
+try:  # Shapely >= 2.0
+    from shapely.validation import make_valid as _shapely_make_valid
+except ImportError:  # pragma: no cover - compatibility with Shapely < 2.0
+    _shapely_make_valid = None
 
 try:
     from tqdm import tqdm
@@ -119,6 +124,45 @@ def _hash_seed(value: object) -> int:
     digest = hashlib.sha256(raw).hexdigest()
     return int(digest[:16], 16) % (2 ** 32)
 
+def _ensure_valid_geometry(geom):
+    """Attempt to repair invalid geometries.
+
+    Returns ``None`` when the geometry cannot be repaired or is empty.
+    """
+
+    if geom is None or geom.is_empty:
+        return None
+    if geom.is_valid:
+        return geom
+
+    candidates = []
+    if _shapely_make_valid is not None:
+        try:
+            candidates.append(_shapely_make_valid(geom))
+        except Exception:  # pragma: no cover - make_valid can raise on some inputs
+            pass
+    try:
+        candidates.append(geom.buffer(0))
+    except Exception:  # pragma: no cover - buffer may fail on exotic geometries
+        pass
+
+    for candidate in candidates:
+        if candidate is None or candidate.is_empty:
+            continue
+        if candidate.is_valid:
+            return candidate
+        if candidate.geom_type == "GeometryCollection":
+            parts = [part for part in candidate.geoms if part.is_valid and not part.is_empty]
+            if not parts:
+                continue
+            try:
+                merged = unary_union(parts)
+            except Exception:  # pragma: no cover - defensive: unary_union may fail
+                continue
+            if merged is not None and not merged.is_empty and merged.is_valid:
+                return merged
+
+    return None
 
 def _build_strtree(records: Iterable[object]) -> Tuple[Optional[STRtree], Dict[int, object]]:
     geometries = [record.geometry for record in records if getattr(record, "geometry", None) is not None]
@@ -183,7 +227,7 @@ def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame,
 
     for building in buildings_df.itertuples():
         _check_deadline(deadline)
-        geom = building.geometry
+        geom = _ensure_valid_geometry(getattr(building, "geometry", None))
         if geom is None or geom.is_empty:
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
@@ -192,7 +236,8 @@ def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame,
             intersection = geom
         else:
             intersection = geom.intersection(zone_geom)
-        if intersection.is_empty:
+        intersection = _ensure_valid_geometry(intersection)
+        if intersection is None or intersection.is_empty:
             continue
         area_in_zone = intersection.area
         if area_in_zone <= 0.0:
@@ -249,7 +294,7 @@ def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame,
 
     for service in services_df.itertuples():
         _check_deadline(deadline)
-        geom = service.geometry
+        geom = _ensure_valid_geometry(getattr(service, "geometry", None))
         if geom is None or geom.is_empty:
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
@@ -258,7 +303,8 @@ def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame,
             intersection = geom
         else:
             intersection = geom.intersection(zone_geom)
-        if intersection.is_empty:
+        intersection = _ensure_valid_geometry(intersection)
+        if intersection is None or intersection.is_empty:
             continue
         service_type = getattr(service, "service_type_name", None)
         service_capacity = getattr(service, "capacity", None)
