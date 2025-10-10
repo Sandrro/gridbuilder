@@ -7,11 +7,12 @@ produces two Parquet datasets:
   least one building.
 * grid_cells.parquet – per-cell information for a 15 m (configurable) square
   grid fitted to every zone.
+* timeout.geojson – geometries of zones that exceeded the processing timeout.
 
 Usage::
 
     python data_processing.py zones.geojson buildings.geojson services.geojson output_dir \
-        [--grid-size 15.0] [--workers 4]
+        [--grid-size 15.0] [--workers 4] [--zone-timeout 200.0]
 
 The resulting Parquet files are written inside ``output_dir``.
 """
@@ -25,6 +26,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import geopandas as gpd
@@ -68,14 +70,26 @@ class ServiceRecord:
 _GLOBAL_BUILDINGS: Optional[gpd.GeoDataFrame] = None
 _GLOBAL_SERVICES: Optional[gpd.GeoDataFrame] = None
 _GLOBAL_GRID_SIZE: float = 0.0
+_GLOBAL_ZONE_TIMEOUT: Optional[float] = None
 
 
-def _init_worker(buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame, grid_size: float) -> None:
-    global _GLOBAL_BUILDINGS, _GLOBAL_SERVICES, _GLOBAL_GRID_SIZE
+class ZoneTimeoutError(RuntimeError):
+    """Raised when processing of a single zone exceeds the allotted time."""
+
+
+def _check_deadline(deadline: Optional[float]) -> None:
+    if deadline is not None and monotonic() > deadline:
+        raise ZoneTimeoutError("Zone processing exceeded the configured timeout")
+
+
+def _init_worker(buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame, grid_size: float,
+                 zone_timeout: Optional[float]) -> None:
+    global _GLOBAL_BUILDINGS, _GLOBAL_SERVICES, _GLOBAL_GRID_SIZE, _GLOBAL_ZONE_TIMEOUT
 
     _GLOBAL_BUILDINGS = buildings_df
     _GLOBAL_SERVICES = services_df
     _GLOBAL_GRID_SIZE = grid_size
+    _GLOBAL_ZONE_TIMEOUT = zone_timeout
 
 
 def _ensure_crs(gdf: gpd.GeoDataFrame, target_crs: str) -> gpd.GeoDataFrame:
@@ -149,13 +163,15 @@ def _write_parquet_chunk(writer: Optional[pq.ParquetWriter], path: Path, records
     return writer
 
 
-def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame) -> Tuple[List[BuildingRecord], float, Optional[float], Optional[float]]:
+def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame,
+                       deadline: Optional[float]) -> Tuple[List[BuildingRecord], float, Optional[float], Optional[float]]:
     zone_bounds = zone_geom.bounds
     records: List[BuildingRecord] = []
     storeys_values: List[float] = []
     coverage_area = 0.0
 
     for building in buildings_df.itertuples():
+        _check_deadline(deadline)
         geom = building.geometry
         if geom is None or geom.is_empty:
             continue
@@ -214,12 +230,14 @@ def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame)
     return records, coverage_area, storeys_min, storeys_max
 
 
-def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame) -> Tuple[List[ServiceRecord], Dict[str, Dict[str, float]]]:
+def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame,
+                      deadline: Optional[float]) -> Tuple[List[ServiceRecord], Dict[str, Dict[str, float]]]:
     zone_bounds = zone_geom.bounds
     summary: Dict[str, Dict[str, float]] = {}
     records: List[ServiceRecord] = []
 
     for service in services_df.itertuples():
+        _check_deadline(deadline)
         geom = service.geometry
         if geom is None or geom.is_empty:
             continue
@@ -264,7 +282,7 @@ def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame) -
     return records, summary
 
 
-def _assign_ring_order(cells: List[Dict[str, object]], zone_geom) -> None:
+def _assign_ring_order(cells: List[Dict[str, object]], zone_geom, deadline: Optional[float]) -> None:
     if not cells:
         return
 
@@ -287,6 +305,7 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom) -> None:
             queue.append(idx)
 
     while queue:
+        _check_deadline(deadline)
         current_idx = queue.popleft()
         current_cell = cells[current_idx]
         row, col = current_cell["row"], current_cell["col"]
@@ -306,15 +325,18 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom) -> None:
         rings[ring].append(idx)
 
     for ring, idxs in rings.items():
+        _check_deadline(deadline)
         for order, cell_idx in enumerate(sorted(idxs, key=lambda i: (cells[i]["row"], cells[i]["col"]))):
             cells[cell_idx]["ring_order"] = order
 
 
-def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[object, BuildingRecord], service_lookup: Dict[object, ServiceRecord]) -> None:
+def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[object, BuildingRecord],
+                       service_lookup: Dict[object, ServiceRecord], deadline: Optional[float]) -> None:
     building_cells: Dict[object, List[int]] = defaultdict(list)
     service_cells: Dict[object, List[int]] = defaultdict(list)
 
     for idx, cell in enumerate(cells):
+        _check_deadline(deadline)
         b_id = cell.get("building_id")
         if b_id is not None:
             building_cells[b_id].append(idx)
@@ -323,6 +345,7 @@ def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[obj
             service_cells[s_id].append(idx)
 
     for b_id, idxs in building_cells.items():
+        _check_deadline(deadline)
         building = building_lookup.get(b_id)
         if building is None:
             continue
@@ -337,6 +360,7 @@ def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[obj
                     cells[idx]["building_living_area"] = share
 
     for s_id, idxs in service_cells.items():
+        _check_deadline(deadline)
         service = service_lookup.get(s_id)
         if service is None:
             continue
@@ -355,11 +379,29 @@ def _get_zone_value(zone_row, attribute: str, default=None):
     return getattr(zone_row, attribute, default)
 
 
-def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame, cell_size: float) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
+def _make_timeout_record(zone_row) -> Optional[Dict[str, object]]:
+    zone_geom = _get_zone_value(zone_row, "geometry")
+    if zone_geom is None or zone_geom.is_empty:
+        return None
+    zone_id = _get_zone_value(zone_row, "functional_zone_id")
+    if zone_id is None:
+        zone_id = _get_zone_value(zone_row, "id")
+    zone_type = _get_zone_value(zone_row, "functional_zone_type_name")
+    return {"zone_id": zone_id, "zone_type": zone_type, "geometry": zone_geom}
+
+
+def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.GeoDataFrame,
+                  cell_size: float, zone_timeout: Optional[float]) -> Optional[Tuple[Dict[str, object], List[Dict[str, object]]]]:
+    deadline = None
+    if zone_timeout is not None and zone_timeout > 0:
+        deadline = monotonic() + zone_timeout
+
+    _check_deadline(deadline)
     zone_geom = _get_zone_value(zone_row, "geometry")
     if zone_geom is None or zone_geom.is_empty:
         return None
 
+    _check_deadline(deadline)
     zone_area = zone_geom.area
     if zone_area <= 0:
         return None
@@ -375,7 +417,10 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
         candidate_idx = buildings_df.sindex.query(zone_geom, predicate="intersects")
         buildings_candidates = buildings_df.iloc[np.asarray(candidate_idx)]
 
-    building_records, coverage_area, storeys_min, storeys_max = _prepare_buildings(zone_geom, zone_prepared, buildings_candidates)
+    _check_deadline(deadline)
+    building_records, coverage_area, storeys_min, storeys_max = _prepare_buildings(
+        zone_geom, zone_prepared, buildings_candidates, deadline
+    )
     if not building_records:
         return None
 
@@ -386,7 +431,8 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
         candidate_idx = services_df.sindex.query(zone_geom, predicate="intersects")
         services_candidates = services_df.iloc[np.asarray(candidate_idx)]
 
-    service_records, service_summary = _prepare_services(zone_geom, zone_prepared, services_candidates)
+    _check_deadline(deadline)
+    service_records, service_summary = _prepare_services(zone_geom, zone_prepared, services_candidates, deadline)
     service_tree, service_lookup_by_geom = _build_strtree(service_records)
 
     minx, miny, maxx, maxy = zone_geom.bounds
@@ -406,9 +452,11 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
     service_lookup = {record.service_id: record for record in service_records if record.service_id is not None}
 
     for row_idx in range(rows):
+        _check_deadline(deadline)
         y0 = start_y + row_idx * cell_size
         y1 = y0 + cell_size
         for col_idx in range(cols):
+            _check_deadline(deadline)
             x0 = start_x + col_idx * cell_size
             x1 = x0 + cell_size
             cell_geom = box(x0, y0, x1, y1)
@@ -447,6 +495,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                 candidate_buildings = _query_tree_records(building_tree, building_lookup_by_geom, building_records, cell_geom)
                 ratios: List[Tuple[BuildingRecord, float]] = []
                 for building in candidate_buildings:
+                    _check_deadline(deadline)
                     if not _bbox_intersects(building.bounds, cell_geom.bounds):
                         continue
                     coverage = building.geometry.intersection(cell_geom).area
@@ -474,6 +523,7 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                 candidate_services = _query_tree_records(service_tree, service_lookup_by_geom, service_records, cell_geom)
                 service_ratios: List[Tuple[ServiceRecord, float]] = []
                 for service in candidate_services:
+                    _check_deadline(deadline)
                     if not _bbox_intersects(service.bounds, cell_geom.bounds):
                         continue
                     if service.is_point:
@@ -506,8 +556,9 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
     if not cells:
         return None
 
-    _assign_ring_order(cells, zone_geom)
-    _distribute_values(cells, building_lookup, service_lookup)
+    _check_deadline(deadline)
+    _assign_ring_order(cells, zone_geom, deadline)
+    _distribute_values(cells, building_lookup, service_lookup, deadline)
 
     for cell in cells:
         cell.pop("intersection", None)
@@ -555,11 +606,11 @@ def _process_zone_with_globals(zone_row) -> Optional[Tuple[Dict[str, object], Li
     if _GLOBAL_BUILDINGS is None or _GLOBAL_SERVICES is None:
         raise RuntimeError("Worker is not initialised with shared data")
 
-    return _process_zone(zone_row, _GLOBAL_BUILDINGS, _GLOBAL_SERVICES, _GLOBAL_GRID_SIZE)
+    return _process_zone(zone_row, _GLOBAL_BUILDINGS, _GLOBAL_SERVICES, _GLOBAL_GRID_SIZE, _GLOBAL_ZONE_TIMEOUT)
 
 
 def process(zones_path: Path, buildings_path: Path, services_path: Path, output_dir: Path,
-            grid_size: float = 15.0, workers: int = 1) -> None:
+            grid_size: float = 15.0, workers: int = 1, zone_timeout: float = 200.0) -> None:
     zones = gpd.read_file(zones_path)
     buildings = gpd.read_file(buildings_path)
     services = gpd.read_file(services_path)
@@ -583,20 +634,30 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
     descriptions_writer: Optional[pq.ParquetWriter] = None
     grid_writer: Optional[pq.ParquetWriter] = None
     zones_with_buildings = 0
+    timeout_records: List[Dict[str, object]] = []
 
     try:
         if workers > 1:
             with ProcessPoolExecutor(
                 max_workers=workers,
                 initializer=_init_worker,
-                initargs=(buildings, services, grid_size),
+                initargs=(buildings, services, grid_size, zone_timeout),
             ) as executor:
-                futures = [
-                    executor.submit(_process_zone_with_globals, zone_row)
+                future_to_zone = {
+                    executor.submit(_process_zone_with_globals, zone_row): zone_row
                     for zone_row in tasks
-                ]
-                for future in as_completed(futures):
-                    result = future.result()
+                }
+                for future in as_completed(future_to_zone):
+                    zone_row = future_to_zone.pop(future)
+                    try:
+                        result = future.result()
+                    except ZoneTimeoutError:
+                        record = _make_timeout_record(zone_row)
+                        if record is not None:
+                            timeout_records.append(record)
+                        if progress_bar is not None:
+                            progress_bar.update(1)
+                        continue
                     if progress_bar is not None:
                         progress_bar.update(1)
                     if result is None:
@@ -607,7 +668,15 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
                     zones_with_buildings += 1
         else:
             for zone_row in tasks:
-                result = _process_zone(zone_row, buildings, services, grid_size)
+                try:
+                    result = _process_zone(zone_row, buildings, services, grid_size, zone_timeout)
+                except ZoneTimeoutError:
+                    record = _make_timeout_record(zone_row)
+                    if record is not None:
+                        timeout_records.append(record)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    continue
                 if progress_bar is not None:
                     progress_bar.update(1)
                 if result is None:
@@ -628,6 +697,17 @@ def process(zones_path: Path, buildings_path: Path, services_path: Path, output_
     if grid_writer is not None:
         grid_writer.close()
 
+    timeout_path = output_dir / "timeout.geojson"
+    if timeout_records:
+        timeout_gdf = gpd.GeoDataFrame(timeout_records, geometry="geometry", crs=zones.crs)
+        timeout_gdf.to_file(timeout_path, driver="GeoJSON")
+    else:
+        if timeout_path.exists():
+            try:
+                timeout_path.unlink()
+            except OSError:
+                pass
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare zone descriptions and grids from GeoJSON inputs.")
@@ -637,6 +717,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("output_dir", type=Path, help="Directory where Parquet outputs will be stored")
     parser.add_argument("--grid-size", type=float, default=15.0, help="Grid cell size in metres (default: 15)")
     parser.add_argument("--workers", type=int, default=1, help="Number of worker processes for zone processing")
+    parser.add_argument("--zone-timeout", type=float, default=200.0,
+                        help="Maximum time in seconds allotted for a single zone (default: 200)")
     return parser
 
 
@@ -645,7 +727,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     process(args.zones, args.buildings, args.services, args.output_dir,
-            grid_size=args.grid_size, workers=args.workers)
+            grid_size=args.grid_size, workers=args.workers, zone_timeout=args.zone_timeout)
 
 
 if __name__ == "__main__":
