@@ -109,15 +109,25 @@ _GRID_SCHEMA = pa.schema(
         pa.field("building_storeys_count", pa.float64()),
         pa.field("building_living_area", pa.float64()),
         pa.field("building_year", pa.float64()),
-        pa.field("service_id", pa.string()),
-        pa.field("service_type_name", pa.string()),
-        pa.field("service_capacity", pa.float64()),
+        pa.field("service_types_json", pa.string()),
+        pa.field("service_ids_json", pa.string()),
+        pa.field("service_capacity_json", pa.string()),
         pa.field("geometry", pa.binary()),
     ]
 )
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    return str(value)
+
+
+def _json_dumps(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
 
 
 class _ProgressTracker:
@@ -250,11 +260,15 @@ def _ensure_valid_geometry(geom):
     return None
 
 def _build_strtree(records: Iterable[object]) -> Tuple[Optional[STRtree], Dict[int, object]]:
-    geometries = [record.geometry for record in records if getattr(record, "geometry", None) is not None]
+    records_with_geom = [record for record in records if getattr(record, "geometry", None) is not None]
+    geometries = [record.geometry for record in records_with_geom]
     if not geometries:
         return None, {}
     tree = STRtree(geometries)
-    lookup = {id(geom): record for geom, record in zip(geometries, records)}
+    lookup: Dict[int, object] = {}
+    for idx, (geom, record) in enumerate(zip(geometries, records_with_geom)):
+        lookup[id(geom)] = record
+        lookup[idx] = record
     return tree, lookup
 
 
@@ -272,6 +286,11 @@ def _query_tree_records(tree: Optional[STRtree], lookup: Dict[int, object], fall
     results: List[object] = []
     for candidate in candidates:
         record = lookup.get(id(candidate))
+        if record is None:
+            try:
+                record = lookup.get(int(candidate))
+            except (TypeError, ValueError):
+                record = None
         if record is None:
             continue
         marker = id(record)
@@ -541,9 +560,10 @@ def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[obj
         b_id = cell.get("building_id")
         if b_id is not None:
             building_cells[b_id].append(idx)
-        s_id = cell.get("service_id")
-        if s_id is not None:
-            service_cells[s_id].append(idx)
+        for service_id in cell.get("service_ids", []) or []:
+            service_cells[service_id].append(idx)
+        if "service_capacity_by_type" not in cell or cell["service_capacity_by_type"] is None:
+            cell["service_capacity_by_type"] = {}
 
     for b_id, idxs in building_cells.items():
         _check_deadline(deadline)
@@ -565,14 +585,16 @@ def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[obj
         service = service_lookup.get(s_id)
         if service is None:
             continue
-        for idx in idxs:
-            cells[idx]["service_type_name"] = service.service_type
         capacity = service.capacity
-        if capacity is not None:
-            share = capacity / len(idxs) if idxs else None
-            if share is not None:
-                for idx in idxs:
-                    cells[idx]["service_capacity"] = share
+        if capacity is None:
+            continue
+        share = capacity / len(idxs) if idxs else None
+        if share is None:
+            continue
+        service_type = service.service_type or "unknown"
+        for idx in idxs:
+            capacity_map = cells[idx].setdefault("service_capacity_by_type", {})
+            capacity_map[service_type] = capacity_map.get(service_type, 0.0) + share
 
 def _get_zone_value(zone_row, attribute: str, default=None):
     if isinstance(zone_row, dict):
@@ -699,9 +721,10 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                 "building_storeys_count": None,
                 "building_living_area": None,
                 "building_year": None,
-                "service_id": None,
-                "service_type_name": None,
-                "service_capacity": None,
+                "service_ids": [],
+                "service_type_counts": {},
+                "service_ids_by_type": {},
+                "service_capacity_by_type": {},
             }
 
             # Building assignment
@@ -764,16 +787,21 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                     service_ratios.append((service, coverage_ratio))
 
                 if service_ratios:
-                    max_ratio = max(ratio for _, ratio in service_ratios)
-                    if max_ratio > 0.5 + 1e-9:
-                        top_candidates = [rec for rec, ratio in service_ratios if math.isclose(ratio, max_ratio, rel_tol=1e-9, abs_tol=1e-9)]
-                        best_service = rng.choice(top_candidates) if len(top_candidates) > 1 else top_candidates[0]
-                        cell_record["service_id"] = best_service.service_id
-                    elif math.isclose(max_ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9):
-                        tied_half = [rec for rec, ratio in service_ratios if math.isclose(ratio, 0.5, rel_tol=1e-9, abs_tol=1e-9)]
-                        if tied_half:
-                            chosen_service = rng.choice(tied_half) if len(tied_half) > 1 else tied_half[0]
-                            cell_record["service_id"] = chosen_service.service_id
+                    service_type_counts: Dict[str, int] = defaultdict(int)
+                    service_ids_by_type: Dict[str, List[object]] = defaultdict(list)
+                    collected_service_ids: List[object] = []
+                    for service, _ratio in service_ratios:
+                        service_type = service.service_type or "unknown"
+                        service_type_counts[service_type] += 1
+                        service_ids_by_type[service_type].append(service.service_id)
+                        if service.service_id is not None:
+                            collected_service_ids.append(service.service_id)
+                    if service_type_counts:
+                        cell_record["service_type_counts"] = dict(service_type_counts)
+                    if service_ids_by_type:
+                        cell_record["service_ids_by_type"] = {key: value for key, value in service_ids_by_type.items()}
+                    if collected_service_ids:
+                        cell_record["service_ids"] = collected_service_ids
 
             cells.append(cell_record)
 
@@ -794,8 +822,8 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
         "building_coverage_ratio": coverage_area / zone_area if zone_area > 0 else np.nan,
         "storeys_min": np.nan if storeys_min is None else float(storeys_min),
         "storeys_max": np.nan if storeys_max is None else float(storeys_max),
-        "service_counts": json.dumps({k: v["count"] for k, v in service_summary.items()}, ensure_ascii=False),
-        "service_capacities": json.dumps({k: v["capacity"] for k, v in service_summary.items()}, ensure_ascii=False),
+        "service_counts": _json_dumps({k: v["count"] for k, v in service_summary.items()}),
+        "service_capacities": _json_dumps({k: v["capacity"] for k, v in service_summary.items()}),
     }
 
     living_values = [record.living_area_in_zone for record in building_records if record.living_area_in_zone is not None]
@@ -817,9 +845,9 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
                 "building_storeys_count": cell.get("building_storeys_count"),
                 "building_living_area": cell.get("building_living_area"),
                 "building_year": cell.get("building_year"),
-                "service_id": cell.get("service_id"),
-                "service_type_name": cell.get("service_type_name"),
-                "service_capacity": cell.get("service_capacity"),
+                "service_types_json": _json_dumps(cell.get("service_type_counts") or {}),
+                "service_ids_json": _json_dumps(cell.get("service_ids_by_type") or {}),
+                "service_capacity_json": _json_dumps(cell.get("service_capacity_by_type") or {}),
                 "geometry": geometry_bytes,
             }
         )
