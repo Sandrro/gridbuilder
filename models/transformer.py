@@ -143,13 +143,19 @@ class PromptEncoder(nn.Module):
         service_prompt: torch.Tensor,
         service_mask: torch.Tensor,
     ) -> torch.Tensor:
+        batch_size = zone_type_ids.size(0)
+
         zone_tok = self.zone_embedding(zone_type_ids).unsqueeze(1)
+
         living_normed = self.living_norm(living_prompt)
-        living_tok = self.living_proj(living_normed) * living_mask.unsqueeze(-1)
+        living_tok = self.living_proj(living_normed).unsqueeze(1)
+        living_mask = living_mask.reshape(batch_size, 1, 1)
+        living_tok = living_tok * living_mask
         if self.service_proj is not None and service_prompt.size(1) > 0:
             service_normed = self.service_norm(service_prompt)
             has_budget = (service_mask.sum(dim=1, keepdim=True) > 0).float()
-            service_tok = self.service_proj(service_normed) * has_budget
+            service_tok = self.service_proj(service_normed).unsqueeze(1)
+            service_tok = service_tok * has_budget.reshape(batch_size, 1, 1)
         else:
             service_tok = torch.zeros_like(living_tok)
         tokens = torch.cat([zone_tok, living_tok, service_tok], dim=1)
