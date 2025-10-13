@@ -214,7 +214,8 @@ def main() -> None:
         living_prob = torch.sigmoid(model_outputs["is_living_logits"][0, idx]).item()
         storeys = model_outputs["storeys"][0, idx].item()
         living_area = F.softplus(model_outputs["living_area"][0, idx]).item()
-        service_capacity = F.softplus(model_outputs["service_capacity"][0, idx]).item()
+        service_capacity_vector = F.softplus(model_outputs["service_capacity"][0, idx])
+        service_capacity = 0.0
 
         service_type = None
         if class_id in (2, 3) and vocab.get("service_types"):
@@ -222,6 +223,7 @@ def main() -> None:
             guided_service_logits = tracker.guidance_for_service(service_logits, remaining_steps)
             service_type_id = nucleus_sample(guided_service_logits, args.top_p, args.temperature)
             service_type = vocab["service_types"][service_type_id]
+            service_capacity = float(service_capacity_vector[service_type_id].item())
         else:
             service_capacity = 0.0
 

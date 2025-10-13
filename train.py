@@ -107,22 +107,33 @@ def compute_losses(
     living_area_loss = F.smooth_l1_loss(living_area_pred, living_area_target, reduction="none")
     living_area_loss = (living_area_loss * living_area_mask).sum() / living_area_mask.sum().clamp_min(1.0)
 
-    service_logits = outputs["service_type_logits"].permute(0, 2, 1)
-    service_target = batch["service_type"]
-    service_mask = batch["service_type_mask"]
-    masked_target = service_target.clamp(min=0)
-    service_loss = F.cross_entropy(service_logits, masked_target, reduction="none")
-    service_loss = (service_loss * service_mask).sum() / service_mask.sum().clamp_min(1.0)
+    service_logits = outputs["service_type_logits"]
+    service_presence = batch["service_presence"]
+    service_presence_mask = batch["service_presence_mask"]
+    if service_logits.size(-1) > 0 and service_presence_mask.sum() > 0:
+        service_loss_tensor = F.binary_cross_entropy_with_logits(
+            service_logits,
+            service_presence,
+            reduction="none",
+        )
+        service_loss = (service_loss_tensor * service_presence_mask).sum() / service_presence_mask.sum().clamp_min(1.0)
+    else:
+        service_loss = torch.tensor(0.0, device=mask.device)
 
-    service_capacity_pred = F.softplus(outputs["service_capacity"].squeeze(-1))
+    service_capacity_pred = F.softplus(outputs["service_capacity"])
     service_capacity_target = batch["service_capacity"]
     service_capacity_mask = batch["service_capacity_mask"]
-    service_capacity_loss = F.smooth_l1_loss(
-        service_capacity_pred,
-        service_capacity_target,
-        reduction="none",
-    )
-    service_capacity_loss = (service_capacity_loss * service_capacity_mask).sum() / service_capacity_mask.sum().clamp_min(1.0)
+    if service_capacity_pred.size(-1) > 0 and service_capacity_mask.sum() > 0:
+        service_capacity_loss_tensor = F.smooth_l1_loss(
+            service_capacity_pred,
+            service_capacity_target,
+            reduction="none",
+        )
+        service_capacity_loss = (
+            service_capacity_loss_tensor * service_capacity_mask
+        ).sum() / service_capacity_mask.sum().clamp_min(1.0)
+    else:
+        service_capacity_loss = torch.tensor(0.0, device=mask.device)
 
     batch_cells = batch["num_cells"].clamp_min(1.0)
     total_living_pred = (living_area_pred * living_area_mask).sum(dim=1)
@@ -135,9 +146,9 @@ def compute_losses(
 
     service_aggregate_losses: List[torch.Tensor] = []
     for idx, service in enumerate(dataset.service_types):
-        type_mask = (service_target == idx).float()
-        pred_sum = (service_capacity_pred * type_mask).sum(dim=1)
-        target_sum = (service_capacity_target * type_mask).sum(dim=1)
+        type_mask = service_capacity_mask[:, :, idx]
+        pred_sum = (service_capacity_pred[:, :, idx] * type_mask).sum(dim=1)
+        target_sum = (service_capacity_target[:, :, idx] * type_mask).sum(dim=1)
         pred_density = torch.log1p(pred_sum / batch_cells)
         target_density = torch.log1p(target_sum / batch_cells)
         mean = dataset.capacity_mean.get(service, 0.0)
@@ -168,7 +179,7 @@ def compute_losses(
         "loss/is_living": float(living_loss.item()),
         "loss/storeys": float(storeys_loss.item()),
         "loss/living_area": float(living_area_loss.item()),
-        "loss/service_type": float(service_loss.item()),
+        "loss/service_presence": float(service_loss.item()),
         "loss/service_capacity": float(service_capacity_loss.item()),
         "loss/aggregate_living": float(aggregate_living_loss.item()),
         "loss/aggregate_service": float(aggregate_service_loss.item()),
