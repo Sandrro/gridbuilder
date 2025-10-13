@@ -116,6 +116,7 @@ class GridDataset(Dataset):
 
         self.zone_ids: List[str] = []
         self.service_types: List[str] = []
+        self.service_type_to_id: Dict[str, int] = {}
         self.zone_type_to_id: Dict[str, int] = {}
         self.id_to_zone_type: Dict[int, str] = {}
         self.service_type_to_id: Dict[str, int] = {}
@@ -152,6 +153,12 @@ class GridDataset(Dataset):
 
     def _prepare_vocabularies(self) -> None:
         service_types: set[str] = set()
+        for raw in self.grid_df.get("service_types_json", pd.Series(dtype=object)).dropna():
+            for name in _parse_service_json(raw).keys():
+                service_types.add(str(name))
+        for raw in self.grid_df.get("service_capacity_json", pd.Series(dtype=object)).dropna():
+            for name in _parse_service_json(raw).keys():
+                service_types.add(str(name))
         if "service_type_name" in self.grid_df.columns:
             for name in self.grid_df["service_type_name"].dropna().unique():
                 service_types.add(str(name))
@@ -244,6 +251,24 @@ class GridDataset(Dataset):
             service_prompt_mask[i] = 1.0
 
         building_present = group["building_id"].notna().to_numpy()
+        if "service_types_json" in group:
+            service_counts_series = group["service_types_json"].apply(_parse_service_json)
+        else:
+            service_counts_series = pd.Series([{} for _ in range(num_cells)], index=group.index)
+        if "service_capacity_json" in group:
+            service_capacity_series = group["service_capacity_json"].apply(_parse_service_json)
+        else:
+            service_capacity_series = pd.Series([{} for _ in range(num_cells)], index=group.index)
+
+        service_counts_list = service_counts_series.tolist()
+        service_capacity_list = service_capacity_series.tolist()
+        service_present = np.array([bool(entry) for entry in service_counts_list], dtype=bool)
+        both = building_present & service_present
+        cell_class = np.full(num_cells, 0, dtype=np.int64)
+        cell_class[building_present & ~service_present] = 1
+        cell_class[service_present & ~building_present] = 2
+        cell_class[both] = 3
+
         service_present = np.zeros(num_cells, dtype=bool)
         living_area = group["building_living_area"].fillna(0.0).to_numpy(dtype=np.float32)
         is_living = (living_area > 0).astype(np.float32)
@@ -253,6 +278,20 @@ class GridDataset(Dataset):
         storeys_available = group["building_storeys_count"].notna().to_numpy()
         storeys_mask = np.logical_and(storeys_available, building_present).astype(np.float32)
 
+        service_type_ids = np.full(num_cells, -1, dtype=np.int64)
+        service_capacity = np.zeros(num_cells, dtype=np.float32)
+        for idx_cell, (counts, capacities) in enumerate(zip(service_counts_list, service_capacity_list)):
+            primary_type = "__none__"
+            if capacities:
+                primary_type = max(capacities.items(), key=lambda item: float(item[1]))[0]
+                service_capacity[idx_cell] = float(sum(float(v) for v in capacities.values()))
+            elif counts:
+                primary_type = max(counts.items(), key=lambda item: float(item[1]))[0]
+            mapped = self.service_type_to_id.get(str(primary_type))
+            if mapped is not None:
+                service_type_ids[idx_cell] = mapped
+        service_type_mask = service_present.astype(np.float32)
+        service_capacity_mask = (service_capacity > 0).astype(np.float32)
         service_presence = np.zeros((num_cells, len(self.service_types)), dtype=np.float32)
         service_presence_mask = np.zeros_like(service_presence)
         service_capacity = np.zeros((num_cells, len(self.service_types)), dtype=np.float32)
