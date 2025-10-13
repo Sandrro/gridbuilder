@@ -183,7 +183,7 @@ class AutoregressiveTransformer(nn.Module):
         self.storeys_head = nn.Linear(config.d_model, 1)
         self.living_area_head = nn.Linear(config.d_model, 1)
         self.service_type_head = nn.Linear(config.d_model, service_vocab)
-        self.service_capacity_head = nn.Linear(config.d_model, 1)
+        self.service_capacity_head = nn.Linear(config.d_model, service_vocab)
         self.edge_bias_scale = nn.Parameter(torch.tensor(1.0))
 
     @property
