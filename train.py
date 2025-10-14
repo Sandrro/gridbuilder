@@ -583,6 +583,7 @@ def main() -> None:
         args.descriptions,
         min_cells=args.min_cells,
         max_context=args.max_context,
+        hf_token=args.hf_token,
     )
 
     train_indices, val_indices = stratified_split(dataset, args.val_split, args.seed)
