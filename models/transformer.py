@@ -241,6 +241,7 @@ class AutoregressiveTransformer(nn.Module):
         service_prompt: torch.Tensor,
         service_prompt_mask: torch.Tensor,
         edge_distances: torch.Tensor,
+        forced_prev_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = cell_classes.device
         batch, seq_len = cell_classes.shape
@@ -254,8 +255,11 @@ class AutoregressiveTransformer(nn.Module):
         )
         edge_tokens = self.edge_embeddings.unsqueeze(0).expand(batch, -1, -1)
 
-        start_ids = torch.full((batch, 1), 4, dtype=torch.long, device=device)
-        prev_tokens = torch.cat([start_ids, cell_classes[:, :-1].clamp(min=0)], dim=1)
+        if forced_prev_tokens is not None:
+            prev_tokens = forced_prev_tokens
+        else:
+            start_ids = torch.full((batch, 1), 4, dtype=torch.long, device=device)
+            prev_tokens = torch.cat([start_ids, cell_classes[:, :-1].clamp(min=0)], dim=1)
         cell_emb = self.cell_embedding(prev_tokens)
         cell_emb = self.pos_encoding(cell_emb)
 
@@ -306,4 +310,5 @@ class AutoregressiveTransformer(nn.Module):
             service_prompt=service_prompt,
             service_prompt_mask=service_prompt_mask,
             edge_distances=edge_distances,
+            forced_prev_tokens=None,
         )
