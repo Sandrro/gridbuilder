@@ -514,6 +514,8 @@ def train_one_epoch(
             if writer is not None:
                 for key, value in averages.items():
                     writer.add_scalar(f"train/{key}", value, global_step)
+            if writer is not None and (step + 1) % 100 == 0:
+                writer.flush()
             logger = metrics_utils.MetricsLogger()
     remaining_metrics = logger.to_dict()
     if remaining_metrics and writer is not None:
