@@ -7,7 +7,7 @@ import logging
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -20,6 +20,9 @@ from data.dataset import EDGE_TOKENS, GridDataset, collate_zone_batch
 from models.transformer import AutoregressiveTransformer, ModelConfig
 from utils import metrics as metrics_utils
 from utils.io import ensure_dir, save_json
+
+if TYPE_CHECKING:
+    from torch.utils.tensorboard import SummaryWriter
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +47,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp16", action="store_true", help="Use automatic mixed precision")
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--log-every", type=int, default=50, help="Log every N steps")
+    parser.add_argument(
+        "--tensorboard-logdir",
+        default="tensorboard",
+        help="Relative directory inside --out-dir for TensorBoard logs",
+    )
+    parser.add_argument("--upload-to-hf", action="store_true", help="Upload artifacts to HuggingFace Hub")
+    parser.add_argument("--hf-repo-id", help="Target HuggingFace Hub repository id")
+    parser.add_argument("--hf-token", help="HuggingFace token; falls back to cached token when omitted")
+    parser.add_argument("--hf-branch", default="main", help="Branch to upload artifacts to")
+    parser.add_argument("--hf-repo-path", default="", help="Optional path inside the HuggingFace repository")
+    parser.add_argument("--hf-private", action="store_true", help="Create private repository when allowed")
+    parser.add_argument("--hf-allow-create", action="store_true", help="Create the repository if it does not exist")
+    parser.add_argument(
+        "--hf-commit-message",
+        default="Add GridBuilder training artifacts",
+        help="Commit message used for the HuggingFace upload",
+    )
     return parser.parse_args()
 
 
@@ -202,6 +222,66 @@ def save_checkpoint(
     torch.save(checkpoint, out_dir / "checkpoints" / f"epoch_{epoch}.pt")
 
 
+def create_summary_writer(out_dir: Path, args: argparse.Namespace) -> Optional["SummaryWriter"]:
+    if not args.tensorboard_logdir:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter  # type: ignore
+    except ImportError:
+        logging.warning("TensorBoard is not installed; skipping SummaryWriter setup")
+        return None
+    log_dir = ensure_dir(out_dir / args.tensorboard_logdir)
+    logging.info("TensorBoard logs will be written to %s", log_dir)
+    return SummaryWriter(log_dir=str(log_dir))
+
+
+def upload_artifacts_to_hf(out_dir: Path, args: argparse.Namespace) -> None:
+    if not args.upload_to_hf:
+        return
+    if not args.hf_repo_id:
+        raise ValueError("--hf-repo-id must be provided when --upload-to-hf is used")
+    try:
+        from huggingface_hub import HfApi, HfFolder
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("huggingface_hub is required for uploading to HuggingFace") from exc
+
+    token = args.hf_token or HfFolder.get_token()
+    if not token:
+        raise RuntimeError("HuggingFace token not found; provide --hf-token or login with huggingface-cli")
+
+    api = HfApi()
+    if args.hf_allow_create:
+        logging.info("Ensuring HuggingFace repository %s exists", args.hf_repo_id)
+        api.create_repo(
+            repo_id=args.hf_repo_id,
+            repo_type="model",
+            token=token,
+            private=args.hf_private,
+            exist_ok=True,
+        )
+
+    revision = args.hf_branch or "main"
+    logging.info(
+        "Uploading training artifacts from %s to HuggingFace Hub repo %s (branch %s)",
+        out_dir,
+        args.hf_repo_id,
+        revision,
+    )
+    try:
+        api.upload_folder(
+            repo_id=args.hf_repo_id,
+            repo_type="model",
+            folder_path=str(out_dir),
+            path_in_repo=args.hf_repo_path or "",
+            token=token,
+            commit_message=args.hf_commit_message,
+            revision=revision,
+        )
+    except Exception as exc:  # pragma: no cover - network errors are environment specific
+        raise RuntimeError(f"Failed to upload artifacts to HuggingFace Hub: {exc}") from exc
+    logging.info("Upload to HuggingFace Hub completed successfully")
+
+
 
 def train_one_epoch(
     model: AutoregressiveTransformer,
@@ -214,6 +294,7 @@ def train_one_epoch(
     total_steps: int,
     args: argparse.Namespace,
     global_step: int,
+    writer: Optional["SummaryWriter"],
 ) -> int:
     model.train()
     logger = metrics_utils.MetricsLogger()
@@ -249,7 +330,16 @@ def train_one_epoch(
             logging.info("Epoch %s step %s: %s", epoch, step + 1, log_items)
             display_items = list(sorted(averages.items()))[:3]
             progress.set_postfix({k.split('/')[-1]: f"{v:.3f}" for k, v in display_items})
+            if writer is not None:
+                for key, value in averages.items():
+                    writer.add_scalar(f"train/{key}", value, global_step)
             logger = metrics_utils.MetricsLogger()
+    remaining_metrics = logger.to_dict()
+    if remaining_metrics and writer is not None:
+        for key, value in remaining_metrics.items():
+            writer.add_scalar(f"train/{key}", value, global_step)
+    if writer is not None:
+        writer.flush()
     return global_step
 
 
@@ -258,6 +348,8 @@ def evaluate(
     loader: DataLoader,
     dataset: GridDataset,
     device: torch.device,
+    writer: Optional["SummaryWriter"] = None,
+    global_step: Optional[int] = None,
 ) -> Dict[str, float]:
     model.eval()
     logger = metrics_utils.MetricsLogger()
@@ -280,7 +372,12 @@ def evaluate(
             for key, value in metrics.items():
                 logger.update(f"val_{key}", value)
             progress.set_postfix({"loss": f"{float(loss.item()):.3f}"})
-    return logger.to_dict()
+    metrics = logger.to_dict()
+    if writer is not None and global_step is not None:
+        for key, value in metrics.items():
+            writer.add_scalar(f"eval/{key}", value, global_step)
+        writer.flush()
+    return metrics
 
 
 
@@ -290,6 +387,7 @@ def main() -> None:
     set_seed(args.seed)
 
     out_dir = ensure_dir(args.out_dir)
+    writer = create_summary_writer(out_dir, args)
 
     dataset = GridDataset(
         args.grid,
@@ -339,27 +437,34 @@ def main() -> None:
 
     total_steps = max(len(train_loader) * args.epochs, 1)
     global_step = 0
-    for epoch in range(1, args.epochs + 1):
-        logging.info("Starting epoch %d / %d", epoch, args.epochs)
-        global_step = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scaler,
-            dataset,
-            device,
-            epoch,
-            total_steps,
-            args,
-            global_step,
-        )
-        metrics = evaluate(model, val_loader, dataset, device)
-        if metrics:
-            log_items = " ".join(f"{k}={v:.4f}" for k, v in sorted(metrics.items()))
-            logging.info("Epoch %s validation: %s", epoch, log_items)
-        if epoch % args.save_every == 0:
-            save_checkpoint(model, optimizer, epoch, out_dir)
-            logging.info("Checkpoint saved for epoch %d", epoch)
+    try:
+        for epoch in range(1, args.epochs + 1):
+            logging.info("Starting epoch %d / %d", epoch, args.epochs)
+            global_step = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                dataset,
+                device,
+                epoch,
+                total_steps,
+                args,
+                global_step,
+                writer,
+            )
+            metrics = evaluate(model, val_loader, dataset, device, writer=writer, global_step=global_step)
+            if metrics:
+                log_items = " ".join(f"{k}={v:.4f}" for k, v in sorted(metrics.items()))
+                logging.info("Epoch %s validation: %s", epoch, log_items)
+            if writer is not None:
+                writer.flush()
+            if epoch % args.save_every == 0:
+                save_checkpoint(model, optimizer, epoch, out_dir)
+                logging.info("Checkpoint saved for epoch %d", epoch)
+    finally:
+        if writer is not None:
+            writer.close()
 
     torch.save(model.state_dict(), out_dir / "model.pt")
     logging.info("Final model checkpoint saved to %s", out_dir / "model.pt")
@@ -396,6 +501,8 @@ def main() -> None:
     }
     save_json(inference_config, out_dir / "inference_config.json")
     logging.info("Inference configuration saved to %s", out_dir / "inference_config.json")
+
+    upload_artifacts_to_hf(out_dir, args)
 
 
 if __name__ == "__main__":

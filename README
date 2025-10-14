@@ -1,1 +1,42 @@
 GridBuilder - version of Genbuilder.
+
+## FastAPI service
+
+A production-ready FastAPI service is available for orchestrating training and inference.
+
+### Local development
+
+This project targets **Python 3.9** to match the reference environment and expects CUDA-enabled PyTorch wheels. When creating a
+virtual environment, install dependencies with the CUDA index so that `torch` uses GPU builds:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+```
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Docker container
+
+The provided Docker image is based on the NVIDIA CUDA runtime with Python 3.9 preinstalled. Build and run it with GPU access via
+NVIDIA Container Toolkit:
+
+```bash
+docker build -t gridbuilder-api .
+docker run --rm --gpus all -p 8000:8000 gridbuilder-api
+```
+
+### Available endpoints
+
+- `POST /train` — launch the training script with JSON-provided CLI parameters.
+- `POST /infer` — run inference using the existing CLI script.
+- `GET /logs/{job_id}` — stream combined stdout/stderr for background jobs.
+- `GET /tensorboard` — retrieve scalar summaries written by TensorBoard.
+
+## HuggingFace utilities
+
+- Add `--upload-to-hf` to the training script to automatically push checkpoints to the Hub.
+- Use `python scripts/upload_parquet_to_hf.py --repo-id <namespace/dataset>` to publish local Parquet datasets from the `data/`
+directory.
