@@ -18,6 +18,7 @@ TRAIN_SCRIPT = REPO_ROOT / "train.py"
 INFER_SCRIPT = REPO_ROOT / "infer.py"
 
 process_manager = ProcessManager(LOG_DIR)
+_JOB_METADATA: Dict[str, Dict[str, Optional[str]]] = {}
 app = FastAPI(title="GridBuilder Service", version="0.1.0")
 
 
@@ -79,11 +80,22 @@ def start_training(request: TrainRequest, background: BackgroundTasks) -> Dict[s
     _validate_training_parameters(request.parameters)
     job_id = _normalize_job_id("train", request.job_id)
     command = _build_cli_command(TRAIN_SCRIPT, request.parameters)
+    resolved_out_dir = _resolve_subpath(str(request.parameters["out_dir"]))
+    tensorboard_value = request.parameters.get("tensorboard_logdir")
+    if tensorboard_value is None:
+        tensorboard_value = "tensorboard"
+    tensorboard_log_path: Optional[Path]
+    if tensorboard_value:
+        tensorboard_log_path = resolved_out_dir / Path(str(tensorboard_value))
+    else:
+        tensorboard_log_path = None
     try:
         managed = process_manager.start(job_id=job_id, command=command, cwd=REPO_ROOT)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     background.add_task(lambda: managed.process.wait())
+    metadata = _JOB_METADATA.setdefault(job_id, {})
+    metadata["tensorboard_log"] = str(tensorboard_log_path) if tensorboard_log_path else None
     return {
         "job_id": job_id,
         "command": managed.command,
@@ -177,7 +189,10 @@ def tensorboard_scalars(run: str = Query(..., description="Relative path to the 
 def list_processes() -> Dict[str, Any]:
     jobs = []
     for job_id in process_manager.known_jobs():
-        status = process_manager.status(job_id)
+        status = dict(process_manager.status(job_id))
+        metadata = _JOB_METADATA.get(job_id, {})
+        status.update(metadata)
+        status.setdefault("tensorboard_log", None)
         jobs.append(status)
     return {"jobs": jobs}
 
