@@ -7,15 +7,15 @@ RUN apt-get update \
         ca-certificates \
         curl \
         software-properties-common \
-        python3.9 \
-        python3.9-distutils \
-        python3.9-venv \
+        python3 \
+        python3-distutils \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py \
-    && python3.9 get-pip.py \
+    && python3 get-pip.py \
     && rm get-pip.py \
-    && ln -s /usr/bin/python3.9 /usr/local/bin/python
+    && ln -s /usr/bin/python3 /usr/local/bin/python
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
