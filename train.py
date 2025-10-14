@@ -20,6 +20,14 @@ from data.dataset import EDGE_TOKENS, GridDataset, collate_zone_batch
 from models.transformer import AutoregressiveTransformer, ModelConfig
 from utils import metrics as metrics_utils
 from utils.io import ensure_dir, save_json
+from utils.scheduling import linear_warmup
+from torch.distributions import Dirichlet
+
+
+PROMPT_WEIGHT_START = 0.1
+PROMPT_WEIGHT_END = 0.5
+PROMPT_JITTER_PROB = 0.4
+HARD_SCENARIO_PROB = 0.5
 
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
@@ -101,6 +109,9 @@ def compute_losses(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
     dataset: GridDataset,
+    *,
+    lambda_prompt: float,
+    lambda_target: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     mask = batch["sequence_mask"]
 
@@ -112,22 +123,26 @@ def compute_losses(
     living_logits = outputs["is_living_logits"].squeeze(-1)
     living_targets = batch["is_living"]
     living_mask = batch["is_living_mask"]
+    building_mask = ((cell_targets == 1) | (cell_targets == 3)).float()
+    service_cell_mask = ((cell_targets == 2) | (cell_targets == 3)).float()
+
+    living_logits = living_logits * building_mask
     living_loss = F.binary_cross_entropy_with_logits(living_logits, living_targets, reduction="none")
     living_loss = (living_loss * living_mask).sum() / living_mask.sum().clamp_min(1.0)
 
-    storeys_pred = outputs["storeys"].squeeze(-1)
+    storeys_pred = F.softplus(outputs["storeys"].squeeze(-1)) * building_mask
     storeys_target = batch["storeys"]
     storeys_mask = batch["storeys_mask"]
     storeys_loss = F.smooth_l1_loss(storeys_pred, storeys_target, reduction="none")
     storeys_loss = (storeys_loss * storeys_mask).sum() / storeys_mask.sum().clamp_min(1.0)
 
-    living_area_pred = F.softplus(outputs["living_area"].squeeze(-1))
+    living_area_pred = F.softplus(outputs["living_area"].squeeze(-1)) * building_mask
     living_area_target = batch["living_area"]
     living_area_mask = batch["living_area_mask"]
     living_area_loss = F.smooth_l1_loss(living_area_pred, living_area_target, reduction="none")
     living_area_loss = (living_area_loss * living_area_mask).sum() / living_area_mask.sum().clamp_min(1.0)
 
-    service_logits = outputs["service_type_logits"]
+    service_logits = outputs["service_type_logits"] * service_cell_mask.unsqueeze(-1)
     service_presence = batch["service_presence"]
     service_presence_mask = batch["service_presence_mask"]
     if service_logits.size(-1) > 0 and service_presence_mask.sum() > 0:
@@ -140,7 +155,7 @@ def compute_losses(
     else:
         service_loss = torch.tensor(0.0, device=mask.device)
 
-    service_capacity_pred = F.softplus(outputs["service_capacity"])
+    service_capacity_pred = F.softplus(outputs["service_capacity"]) * service_cell_mask.unsqueeze(-1)
     service_capacity_target = batch["service_capacity"]
     service_capacity_mask = batch["service_capacity_mask"]
     if service_capacity_pred.size(-1) > 0 and service_capacity_mask.sum() > 0:
@@ -162,9 +177,19 @@ def compute_losses(
     target_density = torch.log1p(total_living_target / batch_cells)
     living_norm = (pred_density - dataset.living_mean) / max(dataset.living_std, 1e-6)
     target_norm = (target_density - dataset.living_mean) / max(dataset.living_std, 1e-6)
-    aggregate_living_loss = F.smooth_l1_loss(living_norm, target_norm)
+    living_prompt_norm = batch["living_prompt"].squeeze(-1)
+    living_prompt_mask = batch["living_prompt_mask"].squeeze(-1)
+
+    living_target_loss = F.smooth_l1_loss(living_norm, target_norm, reduction="none")
+    living_target_loss = living_target_loss.mean() if living_target_loss.ndim == 1 else living_target_loss
+
+    living_prompt_loss = F.smooth_l1_loss(living_norm, living_prompt_norm, reduction="none")
+    living_prompt_loss = (living_prompt_loss * living_prompt_mask).sum() / living_prompt_mask.sum().clamp_min(1.0)
+    aggregate_living_loss = lambda_target * living_target_loss + lambda_prompt * living_prompt_loss
 
     service_aggregate_losses: List[torch.Tensor] = []
+    service_target_losses: List[torch.Tensor] = []
+    service_prompt_losses: List[torch.Tensor] = []
     for idx, service in enumerate(dataset.service_types):
         type_mask = service_capacity_mask[:, :, idx]
         pred_sum = (service_capacity_pred[:, :, idx] * type_mask).sum(dim=1)
@@ -176,12 +201,32 @@ def compute_losses(
         norm_pred = (pred_density - mean) / std
         norm_target = (target_density - mean) / std
         budget_mask = batch["service_prompt_mask"][:, idx]
-        loss = F.smooth_l1_loss(norm_pred, norm_target, reduction="none")
-        service_aggregate_losses.append((loss * budget_mask).sum() / budget_mask.sum().clamp_min(1.0))
+        target_loss = F.smooth_l1_loss(norm_pred, norm_target, reduction="none")
+        target_valid = (type_mask.sum(dim=1) > 0).float()
+        if target_valid.sum() > 0:
+            target_loss = (target_loss * target_valid).sum() / target_valid.sum().clamp_min(1.0)
+        else:
+            target_loss = torch.tensor(0.0, device=mask.device)
+        prompt_loss = F.smooth_l1_loss(norm_pred, batch["service_prompt"][:, idx], reduction="none")
+        if budget_mask.sum() > 0:
+            prompt_loss = (prompt_loss * budget_mask).sum() / budget_mask.sum().clamp_min(1.0)
+        else:
+            prompt_loss = torch.tensor(0.0, device=mask.device)
+        combined = lambda_target * target_loss + lambda_prompt * prompt_loss
+        service_aggregate_losses.append(combined)
+        service_target_losses.append(target_loss)
+        service_prompt_losses.append(prompt_loss)
     if service_aggregate_losses:
         aggregate_service_loss = torch.stack(service_aggregate_losses).mean()
+        aggregate_service_target = torch.stack(service_target_losses).mean()
+        aggregate_service_prompt = torch.stack(service_prompt_losses).mean()
     else:
         aggregate_service_loss = torch.tensor(0.0, device=mask.device)
+        aggregate_service_target = torch.tensor(0.0, device=mask.device)
+        aggregate_service_prompt = torch.tensor(0.0, device=mask.device)
+
+    aggregate_living_target = living_target_loss if torch.is_tensor(living_target_loss) else torch.tensor(float(living_target_loss), device=mask.device)
+    aggregate_living_prompt = living_prompt_loss if torch.is_tensor(living_prompt_loss) else torch.tensor(float(living_prompt_loss), device=mask.device)
 
     total_loss = (
         cell_loss
@@ -203,10 +248,101 @@ def compute_losses(
         "loss/service_capacity": float(service_capacity_loss.item()),
         "loss/aggregate_living": float(aggregate_living_loss.item()),
         "loss/aggregate_service": float(aggregate_service_loss.item()),
+        "loss/aggregate_living_target": float(aggregate_living_target.item()),
+        "loss/aggregate_living_prompt": float(aggregate_living_prompt.item()),
+        "loss/aggregate_service_target": float(aggregate_service_target.item()),
+        "loss/aggregate_service_prompt": float(aggregate_service_prompt.item()),
     }
     return total_loss, metrics
 
 
+def compute_aggregate_weights(current_step: int, total_steps: int) -> Tuple[float, float]:
+    if total_steps <= 1:
+        return PROMPT_WEIGHT_START, 1.0 - PROMPT_WEIGHT_START
+    denom = max(total_steps - 1, 1)
+    progress = min(max(current_step / denom, 0.0), 1.0)
+    lambda_prompt = PROMPT_WEIGHT_START + (PROMPT_WEIGHT_END - PROMPT_WEIGHT_START) * progress
+    lambda_prompt = float(min(max(lambda_prompt, 0.0), 1.0))
+    lambda_target = float(max(1.0 - lambda_prompt, 0.0))
+    return lambda_prompt, lambda_target
+
+
+def _apply_hard_service_scenario(
+    totals: torch.Tensor,
+    active_indices: torch.Tensor,
+    dataset: GridDataset,
+) -> torch.Tensor:
+    adjusted = totals.clone()
+    if adjusted.numel() == 0:
+        return adjusted
+    index_map = {int(idx): pos for pos, idx in enumerate(active_indices.tolist())}
+    park_idx = dataset.service_type_to_id.get("Park")
+    playground_idx = dataset.service_type_to_id.get("Playground")
+    if park_idx is not None and park_idx in index_map:
+        adjusted[index_map[park_idx]] = 0.0
+    if playground_idx is not None and playground_idx in index_map:
+        adjusted[index_map[playground_idx]] = adjusted[index_map[playground_idx]] * 2.0
+    return adjusted
+
+
+def apply_prompt_jitter(batch: Dict[str, torch.Tensor], dataset: GridDataset, device: torch.device) -> None:
+    if PROMPT_JITTER_PROB <= 0.0:
+        return
+    living_prompts = batch["living_prompt"]
+    batch_size = living_prompts.size(0)
+    if batch_size == 0:
+        return
+    jitter_flags = torch.rand(batch_size, device=device) < PROMPT_JITTER_PROB
+    if not jitter_flags.any():
+        return
+    living_std = max(dataset.living_std, 1e-6)
+    living_mean = dataset.living_mean
+    service_means = torch.tensor(
+        [dataset.capacity_mean.get(service, 0.0) for service in dataset.service_types],
+        device=device,
+        dtype=torch.float32,
+    )
+    service_stds = torch.tensor(
+        [max(dataset.capacity_std.get(service, 1.0), 1e-6) for service in dataset.service_types],
+        device=device,
+        dtype=torch.float32,
+    )
+    for batch_idx in torch.nonzero(jitter_flags, as_tuple=False).squeeze(-1).tolist():
+        num_cells = batch["num_cells"][batch_idx].clamp_min(1.0)
+        # Living area jitter
+        if batch["living_prompt_mask"][batch_idx, 0] > 0:
+            living_norm = living_prompts[batch_idx, 0]
+            density = living_norm * living_std + living_mean
+            total_living = torch.expm1(density) * num_cells
+            if torch.rand(1, device=device).item() < HARD_SCENARIO_PROB:
+                total_living = total_living * 1.3
+            else:
+                noise = torch.empty(1, device=device).uniform_(0.8, 1.2)
+                total_living = total_living * noise.squeeze()
+            new_density = torch.log1p(total_living / num_cells)
+            living_prompts[batch_idx, 0] = (new_density - living_mean) / living_std
+
+        # Service capacity jitter
+        service_mask = batch["service_prompt_mask"][batch_idx].bool()
+        if not service_mask.any():
+            continue
+        service_norm = batch["service_prompt"][batch_idx]
+        densities = service_norm[service_mask] * service_stds[service_mask] + service_means[service_mask]
+        totals = torch.expm1(densities) * num_cells
+        active_indices = torch.nonzero(service_mask, as_tuple=False).squeeze(-1)
+        if torch.rand(1, device=device).item() < HARD_SCENARIO_PROB:
+            totals = _apply_hard_service_scenario(totals, active_indices, dataset)
+        else:
+            dirichlet = Dirichlet(torch.ones_like(totals))
+            proportions = dirichlet.sample().to(device)
+            total_budget = totals.sum()
+            if total_budget <= 1e-6:
+                totals = totals * 0.0
+            else:
+                totals = proportions * total_budget
+        new_densities = torch.log1p(totals / num_cells)
+        normalized = (new_densities - service_means[service_mask]) / service_stds[service_mask]
+        service_norm[service_mask] = normalized
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -301,6 +437,44 @@ def train_one_epoch(
     progress = tqdm(loader, desc=f"Train {epoch}", leave=False, total=len(loader))
     for step, batch in enumerate(progress):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        apply_prompt_jitter(batch, dataset, device)
+        schedule_total = max(total_steps - 1, 1)
+        current_step = min(global_step, schedule_total)
+        sampling_prob = linear_warmup(args.sched_sampling, current_step, schedule_total)
+        forced_prev_tokens: Optional[torch.Tensor] = None
+        if sampling_prob > 0.0:
+            with torch.no_grad():
+                teacher_outputs = model(
+                    batch["cell_class"],
+                    batch["sequence_mask"],
+                    zone_type_ids=batch["zone_type_ids"],
+                    living_prompt=batch["living_prompt"],
+                    living_prompt_mask=batch["living_prompt_mask"],
+                    service_prompt=batch["service_prompt"],
+                    service_prompt_mask=batch["service_prompt_mask"],
+                    edge_distances=batch["edge_distances"],
+                )
+            predicted_classes = teacher_outputs["cell_class_logits"].argmax(dim=-1)
+            start_ids = torch.full(
+                (batch["cell_class"].size(0), 1), 4, dtype=torch.long, device=device
+            )
+            teacher_prev = batch["cell_class"].clamp(min=0)
+            if teacher_prev.size(1) > 0:
+                forced_prev_tokens = torch.cat([start_ids, teacher_prev[:, :-1].clamp(min=0)], dim=1)
+                if teacher_prev.size(1) > 1:
+                    rand_mask = (
+                        torch.rand(teacher_prev.size(0), teacher_prev.size(1) - 1, device=device)
+                        < sampling_prob
+                    )
+                    valid_mask = batch["sequence_mask"][:, :-1].bool()
+                    rand_mask = rand_mask & valid_mask
+                    replacements = predicted_classes[:, :-1].clamp(min=0)
+                    forced_prev_tokens[:, 1:] = torch.where(
+                        rand_mask,
+                        replacements,
+                        teacher_prev[:, :-1].clamp(min=0),
+                    )
+        lambda_prompt, lambda_target = compute_aggregate_weights(current_step, total_steps)
         with torch.cuda.amp.autocast(enabled=args.fp16):
             outputs = model(
                 batch["cell_class"],
@@ -311,8 +485,15 @@ def train_one_epoch(
                 service_prompt=batch["service_prompt"],
                 service_prompt_mask=batch["service_prompt_mask"],
                 edge_distances=batch["edge_distances"],
+                forced_prev_tokens=forced_prev_tokens,
             )
-            loss, metrics = compute_losses(outputs, batch, dataset)
+            loss, metrics = compute_losses(
+                outputs,
+                batch,
+                dataset,
+                lambda_prompt=lambda_prompt,
+                lambda_target=lambda_target,
+            )
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
@@ -353,6 +534,8 @@ def evaluate(
 ) -> Dict[str, float]:
     model.eval()
     logger = metrics_utils.MetricsLogger()
+    lambda_prompt_eval = PROMPT_WEIGHT_END
+    lambda_target_eval = max(1.0 - lambda_prompt_eval, 0.0)
     with torch.no_grad():
         progress = tqdm(loader, desc="Eval", leave=False, total=len(loader))
         for batch in progress:
@@ -367,7 +550,13 @@ def evaluate(
                 service_prompt_mask=batch["service_prompt_mask"],
                 edge_distances=batch["edge_distances"],
             )
-            loss, metrics = compute_losses(outputs, batch, dataset)
+            loss, metrics = compute_losses(
+                outputs,
+                batch,
+                dataset,
+                lambda_prompt=lambda_prompt_eval,
+                lambda_target=lambda_target_eval,
+            )
             logger.update("loss/total", float(loss.item()))
             for key, value in metrics.items():
                 logger.update(f"val_{key}", value)
