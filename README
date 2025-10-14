@@ -40,3 +40,18 @@ docker run --rm --gpus all -p 8000:8000 gridbuilder-api
 - Add `--upload-to-hf` to the training script to automatically push checkpoints to the Hub.
 - Use `python scripts/upload_parquet_to_hf.py --repo-id <namespace/dataset>` to publish local Parquet datasets from the `data/`
 directory.
+
+## Training example
+
+Run the training loop against datasets hosted on the HuggingFace Hub, providing your access token when required:
+
+```bash
+python train.py \
+  --descriptions hf://datasets/Assandrro/genbuilder_data_grid/descriptions.parquet \
+  --grid hf://datasets/Assandrro/genbuilder_data_grid/grid_cells.parquet \
+  --out-dir genbuilder_1 \
+  --epochs 1 \
+  --hf-token "$HF_TOKEN"
+```
+
+Replace `"$HF_TOKEN"` with a real token or omit the flag when the dataset is public and cached locally.

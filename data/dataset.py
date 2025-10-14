@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -94,6 +94,18 @@ def _parse_service_json(raw: str | float | None) -> Dict[str, float]:
     return result
 
 
+def _read_parquet(path: str, *, storage_options: Dict[str, Any] | None = None) -> pd.DataFrame:
+    """Read a Parquet file with a clearer error message when engines are missing."""
+
+    try:
+        return pd.read_parquet(path, storage_options=storage_options)
+    except ImportError as exc:  # pragma: no cover - depends on optional deps
+        raise ImportError(
+            "Reading Parquet files requires the 'pyarrow' dependency. "
+            "Install it with `pip install pyarrow` and retry."
+        ) from exc
+
+
 class GridDataset(Dataset):
     """PyTorch dataset that yields :class:`ZoneExample` objects."""
 
@@ -104,10 +116,12 @@ class GridDataset(Dataset):
         *,
         min_cells: int = 16,
         max_context: int | None = None,
+        hf_token: str | None = None,
     ) -> None:
         super().__init__()
-        self.grid_df = pd.read_parquet(grid_path)
-        self.desc_df = pd.read_parquet(descriptions_path)
+        storage_options = {"token": hf_token} if hf_token else None
+        self.grid_df = _read_parquet(grid_path, storage_options=storage_options)
+        self.desc_df = _read_parquet(descriptions_path, storage_options=storage_options)
         self.min_cells = min_cells
         self.max_context = max_context
 
