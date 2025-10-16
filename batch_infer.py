@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--beam", type=int, default=1)
+    p.add_argument(
+        "--budget-guidance-strength",
+        type=float,
+        default=1.0,
+        help="Pass-through for infer.py --budget-guidance-strength",
+    )
 
     # infer.py parallel mode
     p.add_argument("--max-parallel", type=int, default=4, help="Batch size for zones processed in parallel")
@@ -277,6 +283,7 @@ def main() -> None:
             "--temperature", str(args.temperature),
             "--top-p", str(args.top_p),
             "--beam", str(args.beam),
+            "--budget-guidance-strength", str(args.budget_guidance_strength),
             "--log-level", str(args.infer_log_level),
         ]
         if args.infer_no_progress:

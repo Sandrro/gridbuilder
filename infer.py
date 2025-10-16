@@ -119,21 +119,34 @@ def load_zone_from_grid(grid_path: str, zone_id: str) -> pd.DataFrame:
 
 # ---------------------- Sampling ----------------------
 
-def nucleus_sample(logits: torch.Tensor, top_p: float, temperature: float) -> int:
-    logits = logits / max(temperature, 1e-6)
-    probs = F.softmax(logits, dim=-1)
+def nucleus_distribution(logits: torch.Tensor, top_p: float, temperature: float) -> torch.Tensor:
+    """Return the probability vector actually used for nucleus sampling."""
+
+    scaled = logits / max(temperature, 1e-6)
+    probs = F.softmax(scaled, dim=-1)
+
+    if top_p >= 1.0 or top_p <= 0.0:
+        return probs
+
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
     cumulative = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = cumulative > top_p
-    if cutoff.any():
-        first_idx = torch.nonzero(cutoff, as_tuple=False)[0, 0]
-        sorted_probs = sorted_probs[: first_idx + 1]
-        sorted_indices = sorted_indices[: first_idx + 1]
-        probs = sorted_probs / sorted_probs.sum()
-        choice = torch.multinomial(probs, num_samples=1)
-        return int(sorted_indices[choice])
+    cutoff_mask = cumulative > top_p
+    if cutoff_mask.any():
+        cutoff_idx = int(torch.nonzero(cutoff_mask, as_tuple=False)[0, 0])
+        keep_probs = sorted_probs[: cutoff_idx + 1]
+        keep_indices = sorted_indices[: cutoff_idx + 1]
+        renorm = keep_probs / keep_probs.sum()
+        full = torch.zeros_like(probs)
+        full.scatter_(0, keep_indices, renorm)
+        return full
+
+    return probs
+
+
+def nucleus_sample(logits: torch.Tensor, top_p: float, temperature: float) -> int:
+    probs = nucleus_distribution(logits, top_p, temperature)
     choice = torch.multinomial(probs, num_samples=1)
-    return int(choice)
+    return int(choice.item())
 
 
 # ---------------------- Prompts ----------------------
@@ -426,15 +439,23 @@ def _decode_single_zone(
         service_capacity_vector = F.softplus(model_outputs["service_capacity"][0, idx])
         service_capacity = 0.0
         service_type = None
+        service_prob_tensor: Optional[torch.Tensor] = None
 
-        if class_id in (2, 3) and vocab.get("service_types"):
+        if vocab.get("service_types"):
             service_logits = model_outputs["service_type_logits"][0, idx]
             guided_service_logits = tracker.guidance_for_service(service_logits, remaining_steps)
-            service_type_id = nucleus_sample(guided_service_logits, top_p, temperature)
-            service_type = vocab["service_types"][service_type_id]
-            service_capacity = float(service_capacity_vector[service_type_id].item())
+            service_prob_tensor = nucleus_distribution(guided_service_logits, top_p, temperature)
+            if class_id in (2, 3):
+                service_type_id = int(torch.multinomial(service_prob_tensor, num_samples=1).item())
+                service_type = vocab["service_types"][service_type_id]
+                service_capacity = float(service_capacity_vector[service_type_id].item())
         else:
-            service_capacity = 0.0
+            service_prob_tensor = None
+
+        if service_prob_tensor is not None:
+            service_prob_list = [float(x) for x in service_prob_tensor.detach().cpu().tolist()]
+        else:
+            service_prob_list = None
 
         if class_id == 0:
             living_area = 0.0
@@ -480,6 +501,7 @@ def _decode_single_zone(
             "living_area_cell": float(max(living_area, 0.0)),
             "service_type": service_type,
             "service_capacity_cell": float(max(service_capacity, 0.0)),
+            "service_type_probs": service_prob_list,
         })
 
     if bar is not None:
@@ -649,15 +671,18 @@ def _decode_multi_zone_batch(
             service_capacity_vec = F.softplus(mo["service_capacity"][i, t])
             service_capacity = 0.0
             service_type = None
+            service_prob_tensor: Optional[torch.Tensor] = None
 
-            if class_id in (2, 3) and vocab.get("service_types"):
+            if vocab.get("service_types"):
                 service_logits = mo["service_type_logits"][i, t]
                 guided_service_logits = p.tracker.guidance_for_service(service_logits, int(remaining_steps[i]))
-                service_type_id = nucleus_sample(guided_service_logits, top_p, temperature)
-                service_type = vocab["service_types"][service_type_id]
-                service_capacity = float(service_capacity_vec[service_type_id].item())
+                service_prob_tensor = nucleus_distribution(guided_service_logits, top_p, temperature)
+                if class_id in (2, 3):
+                    service_type_id = int(torch.multinomial(service_prob_tensor, num_samples=1).item())
+                    service_type = vocab["service_types"][service_type_id]
+                    service_capacity = float(service_capacity_vec[service_type_id].item())
             else:
-                service_capacity = 0.0
+                service_prob_tensor = None
 
             if class_id == 0:
                 living_area = 0.0
@@ -672,6 +697,11 @@ def _decode_multi_zone_batch(
                 living_area = 0.0
                 storeys = 0.0
                 living_prob = 0.0
+
+            if service_prob_tensor is not None:
+                service_prob_list = [float(x) for x in service_prob_tensor.detach().cpu().tolist()]
+            else:
+                service_prob_list = None
 
             p.tracker.update(class_id, living_area, service_type, service_capacity)
             remaining_steps[i] -= 1
@@ -689,6 +719,7 @@ def _decode_multi_zone_batch(
                 "living_area_cell": float(max(living_area, 0.0)),
                 "service_type": service_type,
                 "service_capacity_cell": float(max(service_capacity, 0.0)),
+                "service_type_probs": service_prob_list,
             })
 
             progressed += 1
