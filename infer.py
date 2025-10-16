@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -90,6 +91,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--beam", type=int, default=1)
+    parser.add_argument(
+        "--budget-guidance-strength",
+        type=float,
+        default=1.0,
+        help="Multiplier for budget-aware logit adjustments",
+    )
 
     # progress/logging
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bar")
@@ -112,21 +119,34 @@ def load_zone_from_grid(grid_path: str, zone_id: str) -> pd.DataFrame:
 
 # ---------------------- Sampling ----------------------
 
-def nucleus_sample(logits: torch.Tensor, top_p: float, temperature: float) -> int:
-    logits = logits / max(temperature, 1e-6)
-    probs = F.softmax(logits, dim=-1)
+def nucleus_distribution(logits: torch.Tensor, top_p: float, temperature: float) -> torch.Tensor:
+    """Return the probability vector actually used for nucleus sampling."""
+
+    scaled = logits / max(temperature, 1e-6)
+    probs = F.softmax(scaled, dim=-1)
+
+    if top_p >= 1.0 or top_p <= 0.0:
+        return probs
+
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
     cumulative = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = cumulative > top_p
-    if cutoff.any():
-        first_idx = torch.nonzero(cutoff, as_tuple=False)[0, 0]
-        sorted_probs = sorted_probs[: first_idx + 1]
-        sorted_indices = sorted_indices[: first_idx + 1]
-        probs = sorted_probs / sorted_probs.sum()
-        choice = torch.multinomial(probs, num_samples=1)
-        return int(sorted_indices[choice])
+    cutoff_mask = cumulative > top_p
+    if cutoff_mask.any():
+        cutoff_idx = int(torch.nonzero(cutoff_mask, as_tuple=False)[0, 0])
+        keep_probs = sorted_probs[: cutoff_idx + 1]
+        keep_indices = sorted_indices[: cutoff_idx + 1]
+        renorm = keep_probs / keep_probs.sum()
+        full = torch.zeros_like(probs)
+        full.scatter_(0, keep_indices, renorm)
+        return full
+
+    return probs
+
+
+def nucleus_sample(logits: torch.Tensor, top_p: float, temperature: float) -> int:
+    probs = nucleus_distribution(logits, top_p, temperature)
     choice = torch.multinomial(probs, num_samples=1)
-    return int(choice)
+    return int(choice.item())
 
 
 # ---------------------- Prompts ----------------------
@@ -183,32 +203,135 @@ def prepare_prompts(
 # ---------------------- Budget tracker ----------------------
 
 class BudgetTracker:
-    """Tracks remaining budgets and produces gentle logit nudges."""
+    """Tracks remaining budgets and produces logit adjustments."""
 
-    def __init__(self, living_total: float, service_totals: Dict[str, float], service_types: List[str]) -> None:
-        self.living_remaining = living_total
-        self.service_remaining = {service: float(service_totals.get(service, 0.0) or 0.0) for service in service_types}
+    def __init__(
+        self,
+        living_total: float,
+        service_totals: Dict[str, float],
+        service_types: List[str],
+        total_steps: int,
+        guidance_strength: float,
+    ) -> None:
+        self.total_steps = max(int(total_steps), 1)
+        self.guidance_strength = float(max(guidance_strength, 0.0))
+
+        self.living_total = float(living_total)
+        self.living_remaining = float(living_total)
+        self.living_target_density = (
+            self.living_total / self.total_steps if self.total_steps > 0 else 0.0
+        )
+
         self.service_types = service_types
+        self.service_remaining = {
+            service: float(service_totals.get(service, 0.0) or 0.0) for service in service_types
+        }
+        self.service_target_density = {
+            service: (
+                self.service_remaining[service] / self.total_steps if self.total_steps > 0 else 0.0
+            )
+            for service in service_types
+        }
+        total_service = float(sum(self.service_remaining.values()))
+        self.service_total_target_density = (
+            total_service / self.total_steps if self.total_steps > 0 else 0.0
+        )
+
+    @staticmethod
+    def _pressure_ratio(remaining: float, target_density: float, steps_left: int) -> float:
+        if remaining <= 0:
+            return 0.0
+        if steps_left <= 0:
+            return float("inf")
+        demand_density = remaining / steps_left
+        if target_density <= 0:
+            return float("inf")
+        return demand_density / target_density
+
+    def _progress_nudge(self, steps_left: int) -> float:
+        if self.total_steps <= 0:
+            return 0.0
+        progress = 1.0 - float(steps_left) / float(self.total_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        return self.guidance_strength * progress
 
     def guidance_for_class(self, class_logits: torch.Tensor, steps_left: int) -> torch.Tensor:
-        adjustment = torch.zeros_like(class_logits)
-        urgency = 1.0 - steps_left / max(steps_left + 1, 1)
+        adjusted = class_logits.clone()
+        steps = max(int(steps_left), 1)
+        base_push = self._progress_nudge(steps)
+
         if self.living_remaining > 0:
-            adjustment[1] += 0.2 * urgency
-            adjustment[3] += 0.2 * urgency
-        if any(value > 0 for value in self.service_remaining.values()):
-            adjustment[2] += 0.2 * urgency
-            adjustment[3] += 0.2 * urgency
-        return class_logits + adjustment
+            adjusted[1] += base_push
+            adjusted[3] += base_push
+            ratio = self._pressure_ratio(self.living_remaining, self.living_target_density, steps)
+            if ratio > 1.0:
+                delta = self.guidance_strength * math.log1p(ratio - 1.0)
+                adjusted[1] += delta
+                adjusted[3] += delta
+                adjusted[0] -= delta
+
+        service_remaining_total = self.service_remaining_sum()
+        if service_remaining_total > 0:
+            adjusted[2] += base_push
+            adjusted[3] += base_push
+            ratio = self._pressure_ratio(
+                service_remaining_total, self.service_total_target_density, steps
+            )
+            if ratio > 1.0:
+                delta = self.guidance_strength * math.log1p(ratio - 1.0)
+                adjusted[2] += delta
+                adjusted[3] += delta
+                adjusted[0] -= delta
+
+        if (self.living_remaining > 0 or service_remaining_total > 0) and steps <= 1:
+            adjusted[0] -= max(self.guidance_strength, 1.0) * 1e6
+
+        return adjusted
 
     def guidance_for_service(self, service_logits: torch.Tensor, steps_left: int) -> torch.Tensor:
-        adjustment = torch.zeros_like(service_logits)
-        urgency = 1.0 - steps_left / max(steps_left + 1, 1)
+        if not self.service_types:
+            return service_logits
+
+        adjusted = service_logits.clone()
+        steps = max(int(steps_left), 1)
+        base_push = self._progress_nudge(steps)
+        num_types = len(self.service_types)
+        total_remaining = 0.0
+
         for idx, service in enumerate(self.service_types):
             remaining = self.service_remaining.get(service, 0.0)
-            if remaining > 0:
-                adjustment[idx] += 0.2 * urgency
-        return service_logits + adjustment
+            if remaining <= 0:
+                continue
+            total_remaining += remaining
+            adjusted[idx] += base_push
+            ratio = self._pressure_ratio(
+                remaining, self.service_target_density.get(service, 0.0), steps
+            )
+            if ratio > 1.0:
+                delta = self.guidance_strength * math.log1p(ratio - 1.0)
+                adjusted[idx] += delta
+                if num_types > 1:
+                    penalty = delta / (num_types - 1)
+                    for j in range(num_types):
+                        if j != idx:
+                            adjusted[j] -= penalty
+
+        if total_remaining > 0 and steps <= 1:
+            max_idx = 0
+            max_remaining = -1.0
+            for idx, service in enumerate(self.service_types):
+                remaining = self.service_remaining.get(service, 0.0)
+                if remaining > max_remaining:
+                    max_remaining = remaining
+                    max_idx = idx
+            large = max(self.guidance_strength, 1.0) * 1e6
+            for j in range(num_types):
+                if j == max_idx:
+                    adjusted[j] += large
+                else:
+                    adjusted[j] -= large
+
+        return adjusted
 
     def update(self, class_id: int, living_area: float, service_type: Optional[str], service_capacity: float) -> None:
         if class_id in (1, 3):
@@ -251,6 +374,7 @@ def _decode_single_zone(
     no_progress: bool,
     out_parquet: str,
     out_geojson: Optional[str] = None,
+    budget_guidance_strength: float = 1.0,
 ) -> None:
     logger.info("Reading grid parquet for zone_id=%s from %s", zone_id, grid_path)
     zone_df = load_zone_from_grid(grid_path, zone_id)
@@ -273,7 +397,13 @@ def _decode_single_zone(
     edge_distances = torch.from_numpy(distances).unsqueeze(0).to(device)
     generated_classes = torch.zeros(1, num_cells, dtype=torch.long, device=device)
 
-    tracker = BudgetTracker(prompts["living_budget_total"], prompts["service_budgets"], vocab.get("service_types", []))
+    tracker = BudgetTracker(
+        prompts["living_budget_total"],
+        prompts["service_budgets"],
+        vocab.get("service_types", []),
+        total_steps=num_cells,
+        guidance_strength=budget_guidance_strength,
+    )
 
     outputs: List[Dict[str, Any]] = []
     remaining_steps = num_cells
@@ -309,15 +439,23 @@ def _decode_single_zone(
         service_capacity_vector = F.softplus(model_outputs["service_capacity"][0, idx])
         service_capacity = 0.0
         service_type = None
+        service_prob_tensor: Optional[torch.Tensor] = None
 
-        if class_id in (2, 3) and vocab.get("service_types"):
+        if vocab.get("service_types"):
             service_logits = model_outputs["service_type_logits"][0, idx]
             guided_service_logits = tracker.guidance_for_service(service_logits, remaining_steps)
-            service_type_id = nucleus_sample(guided_service_logits, top_p, temperature)
-            service_type = vocab["service_types"][service_type_id]
-            service_capacity = float(service_capacity_vector[service_type_id].item())
+            service_prob_tensor = nucleus_distribution(guided_service_logits, top_p, temperature)
+            if class_id in (2, 3):
+                service_type_id = int(torch.multinomial(service_prob_tensor, num_samples=1).item())
+                service_type = vocab["service_types"][service_type_id]
+                service_capacity = float(service_capacity_vector[service_type_id].item())
         else:
-            service_capacity = 0.0
+            service_prob_tensor = None
+
+        if service_prob_tensor is not None:
+            service_prob_list = [float(x) for x in service_prob_tensor.detach().cpu().tolist()]
+        else:
+            service_prob_list = None
 
         if class_id == 0:
             living_area = 0.0
@@ -363,6 +501,7 @@ def _decode_single_zone(
             "living_area_cell": float(max(living_area, 0.0)),
             "service_type": service_type,
             "service_capacity_cell": float(max(service_capacity, 0.0)),
+            "service_type_probs": service_prob_list,
         })
 
     if bar is not None:
@@ -418,7 +557,8 @@ def _prepare_zone_pack(
     vocab: Dict[str, Any],
     norm_stats: Dict[str, Any],
     entry: Dict[str, Any],
-    logger: logging.Logger
+    logger: logging.Logger,
+    budget_guidance_strength: float,
 ) -> _ZonePack:
     grid = entry["grid"]
     zone_id = str(entry["zone_id"])
@@ -436,7 +576,13 @@ def _prepare_zone_pack(
 
     budgets = load_json(budget_json)
     prompts = prepare_prompts(vocab, norm_stats, zone_type, budgets, T)
-    tracker = BudgetTracker(prompts["living_budget_total"], prompts["service_budgets"], vocab.get("service_types", []))
+    tracker = BudgetTracker(
+        prompts["living_budget_total"],
+        prompts["service_budgets"],
+        vocab.get("service_types", []),
+        total_steps=T,
+        guidance_strength=budget_guidance_strength,
+    )
 
     logger.debug("Prepared zone %s | T=%d | zone_type=%s", zone_id, T, zone_type)
     return _ZonePack(zone_id, zone_type, zone_df, distances, prompts, tracker, T, out_parquet, out_geojson)
@@ -525,15 +671,18 @@ def _decode_multi_zone_batch(
             service_capacity_vec = F.softplus(mo["service_capacity"][i, t])
             service_capacity = 0.0
             service_type = None
+            service_prob_tensor: Optional[torch.Tensor] = None
 
-            if class_id in (2, 3) and vocab.get("service_types"):
+            if vocab.get("service_types"):
                 service_logits = mo["service_type_logits"][i, t]
                 guided_service_logits = p.tracker.guidance_for_service(service_logits, int(remaining_steps[i]))
-                service_type_id = nucleus_sample(guided_service_logits, top_p, temperature)
-                service_type = vocab["service_types"][service_type_id]
-                service_capacity = float(service_capacity_vec[service_type_id].item())
+                service_prob_tensor = nucleus_distribution(guided_service_logits, top_p, temperature)
+                if class_id in (2, 3):
+                    service_type_id = int(torch.multinomial(service_prob_tensor, num_samples=1).item())
+                    service_type = vocab["service_types"][service_type_id]
+                    service_capacity = float(service_capacity_vec[service_type_id].item())
             else:
-                service_capacity = 0.0
+                service_prob_tensor = None
 
             if class_id == 0:
                 living_area = 0.0
@@ -548,6 +697,11 @@ def _decode_multi_zone_batch(
                 living_area = 0.0
                 storeys = 0.0
                 living_prob = 0.0
+
+            if service_prob_tensor is not None:
+                service_prob_list = [float(x) for x in service_prob_tensor.detach().cpu().tolist()]
+            else:
+                service_prob_list = None
 
             p.tracker.update(class_id, living_area, service_type, service_capacity)
             remaining_steps[i] -= 1
@@ -565,6 +719,7 @@ def _decode_multi_zone_batch(
                 "living_area_cell": float(max(living_area, 0.0)),
                 "service_type": service_type,
                 "service_capacity_cell": float(max(service_capacity, 0.0)),
+                "service_type_probs": service_prob_list,
             })
 
             progressed += 1
@@ -685,7 +840,15 @@ def main() -> None:
             chunk_entries = manifest[idx: idx + max_parallel]
             packs: List[_ZonePack] = []
             for e in chunk_entries:
-                packs.append(_prepare_zone_pack(vocab, norm_stats, e, logger))
+                packs.append(
+                    _prepare_zone_pack(
+                        vocab,
+                        norm_stats,
+                        e,
+                        logger,
+                        budget_guidance_strength=args.budget_guidance_strength,
+                    )
+                )
             _decode_multi_zone_batch(
                 logger=logger,
                 model=model,
@@ -725,6 +888,7 @@ def main() -> None:
             no_progress=args.no_progress,
             out_parquet=args.out_parquet,
             out_geojson=args.out_geojson,
+            budget_guidance_strength=args.budget_guidance_strength,
         )
 
     # Done
