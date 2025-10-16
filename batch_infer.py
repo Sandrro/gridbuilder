@@ -115,6 +115,64 @@ def ensure_multipolygon(geom) -> MultiPolygon:
         return geom
     raise ValueError("Block geometry must be Polygon or MultiPolygon")
 
+
+def _expand_sequence_column(
+    df: pd.DataFrame, column: str, prefix: Optional[str] = None
+) -> pd.DataFrame:
+    """Expand a column containing sequences into numbered columns."""
+    if column not in df.columns:
+        return df
+
+    prefix = prefix or column
+    series = df[column]
+
+    def _is_sequence(value: Any) -> bool:
+        return isinstance(value, (list, tuple, np.ndarray))
+
+    # Find first sequence to determine length
+    seq_lengths: List[int] = [len(v) for v in series if _is_sequence(v)]
+    max_len = max(seq_lengths) if seq_lengths else 0
+    if max_len == 0:
+        return df.drop(columns=[column]) if column in df.columns else df
+
+    def _value_at(seq: Any, idx: int) -> Optional[float]:
+        if not _is_sequence(seq) or len(seq) <= idx:
+            return None
+        value = seq[idx]
+        if isinstance(value, (np.generic,)):
+            value = value.item()
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+
+    for idx in range(max_len):
+        col_name = f"{prefix}_{idx}"
+        df[col_name] = series.apply(lambda seq, idx=idx: _value_at(seq, idx))
+
+    return df.drop(columns=[column])
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert values (including numpy/pandas types) to JSON-serialisable ones."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if value is pd.NA:
+        return None
+    if isinstance(value, (np.generic,)):
+        value = value.item()
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        return value
+    if isinstance(value, (int, str, bool)) or value is None:
+        return value
+    return value
+
 def build_grid_for_block(poly: MultiPolygon, cell: float) -> Tuple[pd.DataFrame, gpd.GeoDataFrame]:
     """Build a square-cell grid clipped to 'poly' in its current (metric) CRS."""
     minx, miny, maxx, maxy = poly.bounds
@@ -321,14 +379,14 @@ def main() -> None:
 
             geom_gdf_metric, epsg = zone_geom_cache[zone_id]
             merged = pred_df.merge(geom_gdf_metric[["cell_id", "geometry"]], on="cell_id", how="left")
+            merged = _expand_sequence_column(merged, "service_type_probs", prefix="service_type_prob")
             merged_gdf = gpd.GeoDataFrame(merged, geometry="geometry", crs=epsg).to_crs(blocks_gdf.crs)
 
             # zone_type was not persisted in pred_df; add from manifest
             zone_type = next((m["zone_type"] for m in manifest if m["zone_id"] == zone_id), None)
 
             for _, prow in merged_gdf.iterrows():
-                props = {k: (None if isinstance(v, float) and np.isnan(v) else v)
-                         for k, v in prow.items() if k != "geometry"}
+                props = {k: _json_safe(v) for k, v in prow.items() if k != "geometry"}
                 props["zone"] = zone_type
                 props["zone_id"] = zone_id
                 out_features.append({
