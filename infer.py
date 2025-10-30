@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -115,6 +116,52 @@ def load_zone_from_grid(grid_path: str, zone_id: str) -> pd.DataFrame:
     zone_df.sort_values(["ring_index", "ring_order"], inplace=True)
     zone_df.reset_index(drop=True, inplace=True)
     return zone_df
+
+
+def _interleaved_zone_order(zone_df: pd.DataFrame) -> pd.DataFrame:
+    """Return a reordered dataframe mixing outer and inner rings."""
+
+    if zone_df.empty or "ring_index" not in zone_df.columns:
+        return zone_df
+
+    unique_rings = sorted(zone_df["ring_index"].unique())
+
+    alternating_rings: List[int] = []
+    lo, hi = 0, len(unique_rings) - 1
+    while lo <= hi:
+        alternating_rings.append(int(unique_rings[lo]))
+        lo += 1
+        if lo <= hi:
+            alternating_rings.append(int(unique_rings[hi]))
+            hi -= 1
+
+    ring_queues = {
+        ring: deque(
+            zone_df[zone_df["ring_index"] == ring]
+            .sort_values("ring_order")
+            .index
+            .tolist()
+        )
+        for ring in unique_rings
+    }
+
+    new_indices: List[int] = []
+    total = len(zone_df)
+    while len(new_indices) < total:
+        progress = False
+        for ring in alternating_rings:
+            queue = ring_queues.get(ring)
+            if not queue:
+                continue
+            new_indices.append(queue.popleft())
+            progress = True
+            if len(new_indices) == total:
+                break
+        if not progress:
+            # Fallback to the existing order if something unexpected happens.
+            return zone_df.reset_index(drop=True)
+
+    return zone_df.loc[new_indices].reset_index(drop=True)
 
 
 # ---------------------- Sampling ----------------------
@@ -255,7 +302,13 @@ class BudgetTracker:
         progress = min(max(progress, 0.0), 1.0)
         return self.guidance_strength * progress
 
-    def guidance_for_class(self, class_logits: torch.Tensor, steps_left: int) -> torch.Tensor:
+    def guidance_for_class(
+        self,
+        class_logits: torch.Tensor,
+        steps_left: int,
+        *,
+        edge_bias: float = 0.0,
+    ) -> torch.Tensor:
         adjusted = class_logits.clone()
         steps = max(int(steps_left), 1)
         base_push = self._progress_nudge(steps)
@@ -282,6 +335,12 @@ class BudgetTracker:
                 adjusted[2] += delta
                 adjusted[3] += delta
                 adjusted[0] -= delta
+
+        if edge_bias > 0:
+            penalty = self.guidance_strength * 0.1 * float(edge_bias)
+            adjusted[1] -= penalty
+            adjusted[2] -= penalty
+            adjusted[3] -= penalty
 
         if (self.living_remaining > 0 or service_remaining_total > 0) and steps <= 1:
             adjusted[0] -= max(self.guidance_strength, 1.0) * 1e6
@@ -378,6 +437,7 @@ def _decode_single_zone(
 ) -> None:
     logger.info("Reading grid parquet for zone_id=%s from %s", zone_id, grid_path)
     zone_df = load_zone_from_grid(grid_path, zone_id)
+    zone_df = _interleaved_zone_order(zone_df)
     rows = zone_df["row"].to_numpy()
     cols = zone_df["col"].to_numpy()
     ring_index = zone_df["ring_index"].to_numpy()
@@ -407,6 +467,7 @@ def _decode_single_zone(
 
     outputs: List[Dict[str, Any]] = []
     remaining_steps = num_cells
+    max_ring_index = int(zone_df["ring_index"].max()) if not zone_df.empty else 0
 
     logger.info("Starting decoding (single) | num_cells=%d, temperature=%.3f, top_p=%.3f, beam=%d",
                 num_cells, temperature, top_p, beam)
@@ -429,7 +490,12 @@ def _decode_single_zone(
             )
 
         cell_logits = model_outputs["cell_class_logits"][0, idx]
-        guided_logits = tracker.guidance_for_class(cell_logits, remaining_steps)
+        current_ring = int(zone_df.loc[idx, "ring_index"])
+        if max_ring_index > 0:
+            edge_bias = 1.0 - (current_ring / max_ring_index)
+        else:
+            edge_bias = 1.0 if current_ring == 0 else 0.0
+        guided_logits = tracker.guidance_for_class(cell_logits, remaining_steps, edge_bias=edge_bias)
         class_id = nucleus_sample(guided_logits, top_p, temperature)
         generated_classes[0, idx] = class_id
 
@@ -550,6 +616,7 @@ class _ZonePack:
     prompts: Dict[str, Any]
     tracker: BudgetTracker
     T: int  # number of cells
+    max_ring_index: int
     out_parquet: str
     out_geojson: Optional[str]
 
@@ -568,11 +635,13 @@ def _prepare_zone_pack(
     out_geojson = entry.get("out_geojson")
 
     zone_df = load_zone_from_grid(grid, zone_id)
+    zone_df = _interleaved_zone_order(zone_df)
     rows = zone_df["row"].to_numpy()
     cols = zone_df["col"].to_numpy()
     ring_index = zone_df["ring_index"].to_numpy()
     distances = _compute_directional_distances(rows, cols, ring_index)
     T = len(zone_df)
+    max_ring_index = int(zone_df["ring_index"].max()) if not zone_df.empty else 0
 
     budgets = load_json(budget_json)
     prompts = prepare_prompts(vocab, norm_stats, zone_type, budgets, T)
@@ -585,7 +654,7 @@ def _prepare_zone_pack(
     )
 
     logger.debug("Prepared zone %s | T=%d | zone_type=%s", zone_id, T, zone_type)
-    return _ZonePack(zone_id, zone_type, zone_df, distances, prompts, tracker, T, out_parquet, out_geojson)
+    return _ZonePack(zone_id, zone_type, zone_df, distances, prompts, tracker, T, max_ring_index, out_parquet, out_geojson)
 
 
 def _decode_multi_zone_batch(
@@ -661,7 +730,14 @@ def _decode_multi_zone_batch(
                 continue  # padding time step
 
             cell_logits = mo["cell_class_logits"][i, t]
-            guided_logits = p.tracker.guidance_for_class(cell_logits, int(remaining_steps[i]))
+            current_ring = int(p.zone_df.loc[t, "ring_index"])
+            if p.max_ring_index > 0:
+                edge_bias = 1.0 - (current_ring / p.max_ring_index)
+            else:
+                edge_bias = 1.0 if current_ring == 0 else 0.0
+            guided_logits = p.tracker.guidance_for_class(
+                cell_logits, int(remaining_steps[i]), edge_bias=edge_bias
+            )
             class_id = nucleus_sample(guided_logits, top_p, temperature)
             generated_classes[i, t] = class_id
 
