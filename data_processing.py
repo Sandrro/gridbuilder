@@ -259,6 +259,27 @@ def _ensure_valid_geometry(geom):
 
     return None
 
+
+def _try_intersection(geom_a, geom_b):
+    """Safely compute an intersection between two geometries.
+
+    Returns a tuple ``(geometry, error)`` where ``geometry`` is ``None`` when the
+    operation failed even after attempting to repair the inputs. ``error`` will
+    contain the last ``GEOSException`` that occurred.
+    """
+
+    try:
+        return geom_a.intersection(geom_b), None
+    except GEOSException as exc:
+        repaired_a = _ensure_valid_geometry(geom_a)
+        repaired_b = _ensure_valid_geometry(geom_b)
+        if repaired_a is None or repaired_b is None:
+            return None, exc
+        try:
+            return repaired_a.intersection(repaired_b), None
+        except GEOSException as exc_repaired:  # pragma: no cover - defensive fallback
+            return None, exc_repaired
+
 def _build_strtree(records: Iterable[object]) -> Tuple[Optional[STRtree], Dict[int, object]]:
     records_with_geom = [record for record in records if getattr(record, "geometry", None) is not None]
     geometries = [record.geometry for record in records_with_geom]
@@ -389,13 +410,17 @@ def _prepare_buildings(zone_geom, zone_prepared, buildings_df: gpd.GeoDataFrame,
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
             continue
-        try:
-            if zone_prepared.contains(geom):
-                intersection = geom
-            else:
-                intersection = geom.intersection(zone_geom)
-        except GEOSException as exc:
-            raise ZoneProcessingError("topology_error", f"Failed to compute building intersection: {exc}") from exc
+        if zone_prepared.contains(geom):
+            intersection = geom
+        else:
+            intersection, error = _try_intersection(geom, zone_geom)
+            if intersection is None:
+                LOGGER.warning(
+                    "Skipping building %s due to intersection error: %s",
+                    getattr(building, "building_id", None) or getattr(building, "id", None) or "<unknown>",
+                    error,
+                )
+                continue
         intersection = _ensure_valid_geometry(intersection)
         if intersection is None or intersection.is_empty:
             continue
@@ -459,13 +484,17 @@ def _prepare_services(zone_geom, zone_prepared, services_df: gpd.GeoDataFrame,
             continue
         if not _bbox_intersects(zone_bounds, geom.bounds):
             continue
-        try:
-            if zone_prepared.contains(geom):
-                intersection = geom
-            else:
-                intersection = geom.intersection(zone_geom)
-        except GEOSException as exc:
-            raise ZoneProcessingError("topology_error", f"Failed to compute service intersection: {exc}") from exc
+        if zone_prepared.contains(geom):
+            intersection = geom
+        else:
+            intersection, error = _try_intersection(geom, zone_geom)
+            if intersection is None:
+                LOGGER.warning(
+                    "Skipping service %s due to intersection error: %s",
+                    getattr(service, "service_id", None) or getattr(service, "id", None) or "<unknown>",
+                    error,
+                )
+                continue
         intersection = _ensure_valid_geometry(intersection)
         if intersection is None or intersection.is_empty:
             continue
@@ -709,16 +738,23 @@ def _process_zone(zone_row, buildings_df: gpd.GeoDataFrame, services_df: gpd.Geo
             cell_geom = box(x0, y0, x1, y1)
             if not _bbox_intersects(cell_geom.bounds, zone_bounds):
                 continue
-            try:
-                if not zone_prepared.intersects(cell_geom):
+            if not zone_prepared.intersects(cell_geom):
+                continue
+            if zone_prepared.contains(cell_geom):
+                intersection = cell_geom
+            else:
+                intersection, error = _try_intersection(cell_geom, zone_geom)
+                if intersection is None:
+                    LOGGER.warning(
+                        "Skipping cell (%s, %s) in zone %s due to intersection error: %s",
+                        row_idx,
+                        col_idx,
+                        zone_id,
+                        error,
+                    )
                     continue
-                if zone_prepared.contains(cell_geom):
-                    intersection = cell_geom
-                else:
-                    intersection = cell_geom.intersection(zone_geom)
-            except GEOSException as exc:
-                raise ZoneProcessingError("topology_error", f"Failed to compute cell intersection: {exc}") from exc
-            if intersection.is_empty:
+            intersection = _ensure_valid_geometry(intersection)
+            if intersection is None or intersection.is_empty:
                 continue
 
             cell_record: Dict[str, object] = {
