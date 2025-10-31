@@ -453,6 +453,7 @@ def train_one_epoch(
                     service_prompt=batch["service_prompt"],
                     service_prompt_mask=batch["service_prompt_mask"],
                     edge_distances=batch["edge_distances"],
+                    cell_coords=batch["cell_coords"],
                 )
             predicted_classes = teacher_outputs["cell_class_logits"].argmax(dim=-1)
             start_ids = torch.full(
@@ -485,6 +486,7 @@ def train_one_epoch(
                 service_prompt=batch["service_prompt"],
                 service_prompt_mask=batch["service_prompt_mask"],
                 edge_distances=batch["edge_distances"],
+                cell_coords=batch["cell_coords"],
                 forced_prev_tokens=forced_prev_tokens,
             )
             loss, metrics = compute_losses(
@@ -551,6 +553,7 @@ def evaluate(
                 service_prompt=batch["service_prompt"],
                 service_prompt_mask=batch["service_prompt_mask"],
                 edge_distances=batch["edge_distances"],
+                cell_coords=batch["cell_coords"],
             )
             loss, metrics = compute_losses(
                 outputs,

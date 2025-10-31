@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 from torch.nn import functional as F
 
-from data.dataset import _compute_directional_distances  # type: ignore
+from data.dataset import _compute_directional_distances, _normalize_coordinates  # type: ignore
 from models.transformer import AutoregressiveTransformer, ModelConfig
 from utils.io import load_json
 
@@ -385,6 +385,7 @@ def _decode_single_zone(
 
     logger.info("Computing directional distances...")
     distances = _compute_directional_distances(rows, cols, ring_index)
+    coords = _normalize_coordinates(rows, cols)
     num_cells = len(zone_df)
     logger.debug("Distances shape: %s", distances.shape)
 
@@ -395,6 +396,7 @@ def _decode_single_zone(
 
     sequence_mask = torch.zeros(1, num_cells, dtype=torch.float32, device=device)
     edge_distances = torch.from_numpy(distances).unsqueeze(0).to(device)
+    cell_coords = torch.from_numpy(coords).unsqueeze(0).to(device)
     generated_classes = torch.zeros(1, num_cells, dtype=torch.long, device=device)
 
     tracker = BudgetTracker(
@@ -426,6 +428,7 @@ def _decode_single_zone(
                 service_prompt_mask=prompts["service_prompt_mask"].to(device),
                 edge_distances=edge_distances,
                 sequence_mask=sequence_mask,
+                cell_coords=cell_coords,
             )
 
         cell_logits = model_outputs["cell_class_logits"][0, idx]
@@ -547,6 +550,7 @@ class _ZonePack:
     zone_type: str
     zone_df: pd.DataFrame
     distances: np.ndarray
+    coords: np.ndarray
     prompts: Dict[str, Any]
     tracker: BudgetTracker
     T: int  # number of cells
@@ -572,6 +576,7 @@ def _prepare_zone_pack(
     cols = zone_df["col"].to_numpy()
     ring_index = zone_df["ring_index"].to_numpy()
     distances = _compute_directional_distances(rows, cols, ring_index)
+    coords = _normalize_coordinates(rows, cols)
     T = len(zone_df)
 
     budgets = load_json(budget_json)
@@ -585,7 +590,7 @@ def _prepare_zone_pack(
     )
 
     logger.debug("Prepared zone %s | T=%d | zone_type=%s", zone_id, T, zone_type)
-    return _ZonePack(zone_id, zone_type, zone_df, distances, prompts, tracker, T, out_parquet, out_geojson)
+    return _ZonePack(zone_id, zone_type, zone_df, distances, coords, prompts, tracker, T, out_parquet, out_geojson)
 
 
 def _decode_multi_zone_batch(
@@ -606,6 +611,7 @@ def _decode_multi_zone_batch(
     # stack / pad tensors
     dir_dim = packs[0].distances.shape[1] if packs[0].distances.ndim == 2 else packs[0].distances.shape[-1]
     edge_distances = np.zeros((B, T_max, dir_dim), dtype=np.float32)
+    cell_coords_np = np.zeros((B, T_max, 2), dtype=np.float32)
     sequence_mask = torch.zeros(B, T_max, dtype=torch.float32, device=device)
     generated_classes = torch.zeros(B, T_max, dtype=torch.long, device=device)
 
@@ -613,9 +619,11 @@ def _decode_multi_zone_batch(
 
     for i, p in enumerate(packs):
         edge_distances[i, :p.T, :] = p.distances
+        cell_coords_np[i, :p.T, :] = p.coords
         # masks will be filled step-wise
 
     edge_distances = torch.from_numpy(edge_distances).to(device)
+    cell_coords = torch.from_numpy(cell_coords_np).to(device)
 
     # Prepare constant prompt tensors per sample
     zone_type_ids = torch.cat([p.prompts["zone_type_id"] for p in packs], dim=0).to(device)  # [B]
@@ -653,6 +661,7 @@ def _decode_multi_zone_batch(
                 service_prompt_mask=service_prompt_mask,
                 edge_distances=edge_distances,
                 sequence_mask=sequence_mask,
+                cell_coords=cell_coords,
             )
 
         # for each active sample at time t: sample and update trackers
