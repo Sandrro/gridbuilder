@@ -40,6 +40,7 @@ class ZoneExample:
     zone_id: str
     zone_type_id: int
     prompt: Dict[str, torch.Tensor]
+    coords: torch.FloatTensor
     cell_class: torch.LongTensor
     is_living: torch.FloatTensor
     is_living_mask: torch.FloatTensor
@@ -75,6 +76,27 @@ def _compute_directional_distances(rows: np.ndarray, cols: np.ndarray, ring_inde
                     break
             distances[idx, dir_id] = steps
     return distances
+
+
+def _normalize_coordinates(rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+    """Normalize integer grid coordinates to the ``[0, 1]`` range per axis."""
+
+    row_min = float(rows.min()) if rows.size else 0.0
+    row_max = float(rows.max()) if rows.size else 0.0
+    col_min = float(cols.min()) if cols.size else 0.0
+    col_max = float(cols.max()) if cols.size else 0.0
+
+    row_range = row_max - row_min
+    col_range = col_max - col_min
+
+    if row_range <= 0:
+        row_range = 1.0
+    if col_range <= 0:
+        col_range = 1.0
+
+    norm_rows = (rows.astype(np.float32) - row_min) / row_range
+    norm_cols = (cols.astype(np.float32) - col_min) / col_range
+    return np.stack([norm_rows, norm_cols], axis=1)
 
 
 def _parse_service_json(raw: str | float | None) -> Dict[str, float]:
@@ -238,6 +260,7 @@ class GridDataset(Dataset):
         cols = group["col"].to_numpy()
         ring_index = group["ring_index"].to_numpy()
         distances = _compute_directional_distances(rows, cols, ring_index)
+        coords = _normalize_coordinates(rows, cols)
 
         zone_type = str(self.zone_meta[zone_id].zone_type)
         zone_type_id = self.zone_type_to_id[zone_type]
@@ -382,6 +405,7 @@ class GridDataset(Dataset):
             zone_id=str(zone_id),
             zone_type_id=zone_type_id,
             prompt=prompt,
+            coords=torch.from_numpy(coords.astype(np.float32)),
             cell_class=torch.from_numpy(cell_class),
             is_living=torch.from_numpy(is_living),
             is_living_mask=torch.from_numpy(is_living_mask),
@@ -407,6 +431,7 @@ def collate_zone_batch(batch: Iterable[ZoneExample]) -> Dict[str, torch.Tensor]:
     cell_class = torch.full((B, max_cells), -1, dtype=torch.long)
     mask = torch.zeros((B, max_cells), dtype=torch.float32)
     edge_distances = torch.zeros((B, max_cells, len(DIRECTIONS)), dtype=torch.float32)
+    coords = torch.zeros((B, max_cells, 2), dtype=torch.float32)
     is_living = torch.zeros((B, max_cells), dtype=torch.float32)
     is_living_mask = torch.zeros((B, max_cells), dtype=torch.float32)
     storeys = torch.zeros((B, max_cells), dtype=torch.float32)
@@ -430,6 +455,7 @@ def collate_zone_batch(batch: Iterable[ZoneExample]) -> Dict[str, torch.Tensor]:
         cell_class[i, :length] = example.cell_class
         mask[i, :length] = 1.0
         edge_distances[i, :length] = example.edge_distances
+        coords[i, :length] = example.coords
         is_living[i, :length] = example.is_living
         is_living_mask[i, :length] = example.is_living_mask
         storeys[i, :length] = example.storeys
@@ -445,6 +471,7 @@ def collate_zone_batch(batch: Iterable[ZoneExample]) -> Dict[str, torch.Tensor]:
         "cell_class": cell_class,
         "sequence_mask": mask,
         "edge_distances": edge_distances,
+        "cell_coords": coords,
         "is_living": is_living,
         "is_living_mask": is_living_mask,
         "storeys": storeys,

@@ -177,6 +177,7 @@ class AutoregressiveTransformer(nn.Module):
         self.prompt_encoder = PromptEncoder(zone_vocab, service_vocab, config.d_model, config.dropout)
         self.edge_embeddings = nn.Parameter(torch.randn(len(EDGE_TOKENS), config.d_model))
         self.cell_embedding = nn.Embedding(5, config.d_model)  # 4 classes + start token
+        self.coord_proj = nn.Linear(2, config.d_model)
         self.pos_encoding = PositionalEncoding(config.d_model, max_len=config.max_positions + 32)
 
         self.layers = nn.ModuleList(
@@ -241,6 +242,7 @@ class AutoregressiveTransformer(nn.Module):
         service_prompt: torch.Tensor,
         service_prompt_mask: torch.Tensor,
         edge_distances: torch.Tensor,
+        cell_coords: torch.Tensor,
         forced_prev_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = cell_classes.device
@@ -260,7 +262,22 @@ class AutoregressiveTransformer(nn.Module):
         else:
             start_ids = torch.full((batch, 1), 4, dtype=torch.long, device=device)
             prev_tokens = torch.cat([start_ids, cell_classes[:, :-1].clamp(min=0)], dim=1)
+
+        if seq_len > 0:
+            coord_dim = cell_coords.size(-1)
+            start_coords = torch.zeros(
+                batch,
+                1,
+                coord_dim,
+                device=device,
+                dtype=cell_coords.dtype,
+            )
+            prev_coords = torch.cat([start_coords, cell_coords[:, :-1]], dim=1)
+        else:
+            prev_coords = cell_coords
         cell_emb = self.cell_embedding(prev_tokens)
+        coord_emb = self.coord_proj(prev_coords)
+        cell_emb = cell_emb + coord_emb
         cell_emb = self.pos_encoding(cell_emb)
 
         x = torch.cat([prompts, edge_tokens, cell_emb], dim=1)
@@ -299,6 +316,7 @@ class AutoregressiveTransformer(nn.Module):
         service_prompt_mask: torch.Tensor,
         edge_distances: torch.Tensor,
         sequence_mask: torch.Tensor,
+        cell_coords: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Convenience wrapper used at inference time."""
         return self.forward(
@@ -310,5 +328,6 @@ class AutoregressiveTransformer(nn.Module):
             service_prompt=service_prompt,
             service_prompt_mask=service_prompt_mask,
             edge_distances=edge_distances,
+            cell_coords=cell_coords,
             forced_prev_tokens=None,
         )
