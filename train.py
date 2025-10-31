@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
@@ -18,6 +20,7 @@ from tqdm.auto import tqdm
 
 from data.dataset import EDGE_TOKENS, GridDataset, collate_zone_batch
 from models.transformer import AutoregressiveTransformer, ModelConfig
+import metrics as regression_metrics
 from utils import metrics as metrics_utils
 from utils.io import ensure_dir, save_json
 from utils.scheduling import linear_warmup
@@ -29,8 +32,167 @@ PROMPT_WEIGHT_END = 0.5
 PROMPT_JITTER_PROB = 0.4
 HARD_SCENARIO_PROB = 0.5
 
+ALL_METRIC_KEYS: Tuple[str, ...] = ("mae", "rmse", "r2", "mape")
+
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
+
+
+def _dist_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    if not _dist_is_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+class RegressionMetricsAccumulator:
+    """Accumulates regression metrics across batches and processes."""
+
+    def __init__(self, metrics: Sequence[str], max_batches: Optional[int] = None) -> None:
+        self.metrics = tuple(dict.fromkeys(metrics))
+        self.max_batches = max_batches if max_batches and max_batches > 0 else None
+        self.batches_processed = 0
+        self.count = 0.0
+        self.sum_abs_error = 0.0
+        self.sum_sq_error = 0.0
+        self.sum_ape = 0.0
+        self.sum_true = 0.0
+        self.sum_true_sq = 0.0
+        self.sum_residual_sq = 0.0
+        self.device: Optional[torch.device] = None
+
+    def update(self, y_pred: torch.Tensor, y_true: torch.Tensor, mask: torch.Tensor) -> None:
+        if not self.metrics:
+            return
+        if self.max_batches is not None and self.batches_processed >= self.max_batches:
+            return
+        self.batches_processed += 1
+
+        y_pred = torch.nan_to_num(y_pred.detach()).to(dtype=torch.float32)
+        y_true = torch.nan_to_num(y_true.detach()).to(dtype=torch.float32)
+        mask_tensor = mask.to(device=y_true.device)
+        if mask_tensor.dtype != torch.bool:
+            mask_tensor = mask_tensor != 0
+        mask_tensor = mask_tensor & torch.ones_like(y_true, dtype=torch.bool, device=y_true.device)
+        flat_mask = mask_tensor.reshape(-1)
+        valid_count = float(flat_mask.sum().item())
+        if valid_count <= 0:
+            return
+
+        if self.device is None:
+            self.device = y_true.device
+
+        self.count += valid_count
+        y_pred_flat = y_pred.reshape(-1)
+        y_true_flat = y_true.reshape(-1)
+
+        if "mae" in self.metrics:
+            batch_mae = regression_metrics.mae(y_pred, y_true, mask_tensor)
+            self.sum_abs_error += float(batch_mae.item()) * valid_count
+        if "rmse" in self.metrics:
+            batch_rmse = regression_metrics.rmse(y_pred, y_true, mask_tensor)
+            self.sum_sq_error += float(batch_rmse.item()) ** 2 * valid_count
+        if "mape" in self.metrics:
+            batch_mape = regression_metrics.mape(y_pred, y_true, mask_tensor)
+            self.sum_ape += float(batch_mape.item()) * valid_count
+        if "r2" in self.metrics:
+            diff = (y_true_flat - y_pred_flat)[flat_mask]
+            true_valid = y_true_flat[flat_mask]
+            self.sum_residual_sq += float(diff.pow(2).sum().item())
+            self.sum_true += float(true_valid.sum().item())
+            self.sum_true_sq += float(true_valid.pow(2).sum().item())
+
+    def compute(self) -> Dict[str, float]:
+        if not self.metrics:
+            return {}
+        device = self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        values: List[float] = [float(self.count)]
+        if "mae" in self.metrics:
+            values.append(self.sum_abs_error)
+        if "rmse" in self.metrics:
+            values.append(self.sum_sq_error)
+        if "mape" in self.metrics:
+            values.append(self.sum_ape)
+        if "r2" in self.metrics:
+            values.extend([self.sum_true, self.sum_true_sq, self.sum_residual_sq])
+
+        tensor = torch.tensor(values, dtype=torch.float64, device=device)
+        if _dist_is_initialized():
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+        idx = 0
+        total_count = tensor[idx].item()
+        idx += 1
+        results: Dict[str, float] = {}
+        if "mae" in self.metrics:
+            total_abs_error = tensor[idx].item()
+            idx += 1
+            results["mae"] = total_abs_error / total_count if total_count > 0 else float("nan")
+        if "rmse" in self.metrics:
+            total_sq_error = tensor[idx].item()
+            idx += 1
+            results["rmse"] = math.sqrt(total_sq_error / total_count) if total_count > 0 else float("nan")
+        if "mape" in self.metrics:
+            total_ape = tensor[idx].item()
+            idx += 1
+            results["mape"] = total_ape / total_count if total_count > 0 else float("nan")
+        if "r2" in self.metrics:
+            sum_true = tensor[idx].item()
+            sum_true_sq = tensor[idx + 1].item()
+            sum_residual_sq = tensor[idx + 2].item()
+            mean_true = sum_true / total_count if total_count > 0 else 0.0
+            ss_tot = sum_true_sq - total_count * (mean_true ** 2)
+            if total_count <= 1 or ss_tot <= 0:
+                r2_value = float("nan") if total_count <= 0 else 0.0
+            else:
+                r2_value = 1.0 - (sum_residual_sq / max(ss_tot, 1e-12))
+            results["r2"] = r2_value
+
+        return results
+
+
+def extract_living_area_predictions(
+    outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    living_logits = outputs["living_area"].squeeze(-1)
+    living_pred = F.softplus(living_logits)
+    living_target = batch["living_area"]
+    mask = batch["living_area_mask"]
+    if "sequence_mask" in batch:
+        mask = mask * batch["sequence_mask"]
+    mask_bool = mask > 0
+    living_pred = living_pred * mask_bool.to(living_pred.dtype)
+    return living_pred, living_target, mask_bool
+
+
+def append_metrics_csv(path: Path, epoch: int, split: str, values: Dict[str, float]) -> None:
+    ensure_dir(path.parent)
+    file_exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["epoch", "split", *ALL_METRIC_KEYS])
+        if not file_exists:
+            writer.writeheader()
+        row: Dict[str, object] = {"epoch": epoch, "split": split}
+        for key in ALL_METRIC_KEYS:
+            value = values.get(key)
+            if value is None:
+                row[key] = ""
+            else:
+                try:
+                    if math.isnan(float(value)):
+                        row[key] = ""
+                    else:
+                        row[key] = value
+                except (TypeError, ValueError):
+                    row[key] = value
+        writer.writerow(row)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,9 +218,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--log-every", type=int, default=50, help="Log every N steps")
     parser.add_argument(
-        "--tensorboard-logdir",
-        default="tensorboard",
-        help="Relative directory inside --out-dir for TensorBoard logs",
+        "--metrics",
+        nargs="+",
+        type=str,
+        default=["mae", "rmse", "r2", "mape"],
+        choices=("mae", "rmse", "r2", "mape"),
+        help="List of regression metrics to compute",
+    )
+    parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs")
+    parser.add_argument(
+        "--metrics-csv",
+        default="artifacts/metrics.csv",
+        help="Path (relative to out dir) to append regression metrics CSV logs",
+    )
+    parser.add_argument(
+        "--logdir",
+        default="",
+        help="TensorBoard log directory (relative to out dir when not absolute)",
+    )
+    parser.add_argument(
+        "--metrics-subsample",
+        type=int,
+        default=0,
+        help="Limit the number of validation batches for metrics computation (0 = all)",
     )
     parser.add_argument("--upload-to-hf", action="store_true", help="Upload artifacts to HuggingFace Hub")
     parser.add_argument("--hf-repo-id", help="Target HuggingFace Hub repository id")
@@ -359,14 +541,20 @@ def save_checkpoint(
 
 
 def create_summary_writer(out_dir: Path, args: argparse.Namespace) -> Optional["SummaryWriter"]:
-    if not args.tensorboard_logdir:
+    if not args.logdir:
+        return None
+    if not is_main_process():
         return None
     try:
         from torch.utils.tensorboard import SummaryWriter  # type: ignore
     except ImportError:
         logging.warning("TensorBoard is not installed; skipping SummaryWriter setup")
         return None
-    log_dir = ensure_dir(out_dir / args.tensorboard_logdir)
+    log_dir = Path(args.logdir)
+    if not log_dir.is_absolute():
+        log_dir = ensure_dir(out_dir / log_dir)
+    else:
+        log_dir = ensure_dir(log_dir)
     logging.info("TensorBoard logs will be written to %s", log_dir)
     return SummaryWriter(log_dir=str(log_dir))
 
@@ -431,9 +619,10 @@ def train_one_epoch(
     args: argparse.Namespace,
     global_step: int,
     writer: Optional["SummaryWriter"],
-) -> int:
+) -> Tuple[int, Dict[str, float]]:
     model.train()
     logger = metrics_utils.MetricsLogger()
+    train_metrics_acc = RegressionMetricsAccumulator(args.metrics)
     progress = tqdm(loader, desc=f"Train {epoch}", leave=False, total=len(loader))
     for step, batch in enumerate(progress):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -496,6 +685,9 @@ def train_one_epoch(
                 lambda_prompt=lambda_prompt,
                 lambda_target=lambda_target,
             )
+        if train_metrics_acc.metrics:
+            living_pred, living_target, living_mask = extract_living_area_predictions(outputs, batch)
+            train_metrics_acc.update(living_pred, living_target, living_mask)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
@@ -525,7 +717,7 @@ def train_one_epoch(
             writer.add_scalar(f"train/{key}", value, global_step)
     if writer is not None:
         writer.flush()
-    return global_step
+    return global_step, train_metrics_acc.compute()
 
 
 def evaluate(
@@ -535,11 +727,14 @@ def evaluate(
     device: torch.device,
     writer: Optional["SummaryWriter"] = None,
     global_step: Optional[int] = None,
-) -> Dict[str, float]:
+    metrics: Sequence[str] = (),
+    metrics_subsample: int = 0,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
     model.eval()
     logger = metrics_utils.MetricsLogger()
     lambda_prompt_eval = PROMPT_WEIGHT_END
     lambda_target_eval = max(1.0 - lambda_prompt_eval, 0.0)
+    metrics_acc = RegressionMetricsAccumulator(metrics, max_batches=metrics_subsample if metrics_subsample > 0 else None)
     with torch.no_grad():
         progress = tqdm(loader, desc="Eval", leave=False, total=len(loader))
         for batch in progress:
@@ -555,7 +750,7 @@ def evaluate(
                 edge_distances=batch["edge_distances"],
                 cell_coords=batch["cell_coords"],
             )
-            loss, metrics = compute_losses(
+            loss, batch_metrics = compute_losses(
                 outputs,
                 batch,
                 dataset,
@@ -563,25 +758,34 @@ def evaluate(
                 lambda_target=lambda_target_eval,
             )
             logger.update("loss/total", float(loss.item()))
-            for key, value in metrics.items():
+            for key, value in batch_metrics.items():
                 logger.update(f"val_{key}", value)
+            if metrics_acc.metrics:
+                living_pred, living_target, living_mask = extract_living_area_predictions(outputs, batch)
+                metrics_acc.update(living_pred, living_target, living_mask)
             progress.set_postfix({"loss": f"{float(loss.item()):.3f}"})
-    metrics = logger.to_dict()
+    metrics_dict = logger.to_dict()
     if writer is not None and global_step is not None:
-        for key, value in metrics.items():
+        for key, value in metrics_dict.items():
             writer.add_scalar(f"eval/{key}", value, global_step)
         writer.flush()
-    return metrics
+    return metrics_dict, metrics_acc.compute()
 
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args.metrics = [metric.lower() for metric in args.metrics]
+    args.metrics = list(dict.fromkeys(args.metrics))
     set_seed(args.seed)
 
     out_dir = ensure_dir(args.out_dir)
     writer = create_summary_writer(out_dir, args)
+    metrics_csv_path = Path(args.metrics_csv)
+    if not metrics_csv_path.is_absolute():
+        metrics_csv_path = out_dir / metrics_csv_path
+    metrics_to_track = tuple(args.metrics)
 
     dataset = GridDataset(
         args.grid,
@@ -635,7 +839,7 @@ def main() -> None:
     try:
         for epoch in range(1, args.epochs + 1):
             logging.info("Starting epoch %d / %d", epoch, args.epochs)
-            global_step = train_one_epoch(
+            global_step, train_metric_values = train_one_epoch(
                 model,
                 train_loader,
                 optimizer,
@@ -648,10 +852,31 @@ def main() -> None:
                 global_step,
                 writer,
             )
-            metrics = evaluate(model, val_loader, dataset, device, writer=writer, global_step=global_step)
-            if metrics:
-                log_items = " ".join(f"{k}={v:.4f}" for k, v in sorted(metrics.items()))
-                logging.info("Epoch %s validation: %s", epoch, log_items)
+            if writer is not None and train_metric_values:
+                for key, value in train_metric_values.items():
+                    writer.add_scalar(f"train/{key}", value, epoch)
+            if is_main_process() and train_metric_values:
+                append_metrics_csv(metrics_csv_path, epoch, "train", train_metric_values)
+
+            if epoch % max(args.val_every, 1) == 0:
+                val_loss_metrics, val_metric_values = evaluate(
+                    model,
+                    val_loader,
+                    dataset,
+                    device,
+                    writer=writer,
+                    global_step=global_step,
+                    metrics=metrics_to_track,
+                    metrics_subsample=args.metrics_subsample,
+                )
+                if val_loss_metrics:
+                    log_items = " ".join(f"{k}={v:.4f}" for k, v in sorted(val_loss_metrics.items()))
+                    logging.info("Epoch %s validation: %s", epoch, log_items)
+                if writer is not None and val_metric_values:
+                    for key, value in val_metric_values.items():
+                        writer.add_scalar(f"val/{key}", value, epoch)
+                if is_main_process() and val_metric_values:
+                    append_metrics_csv(metrics_csv_path, epoch, "val", val_metric_values)
             if writer is not None:
                 writer.flush()
             if epoch % args.save_every == 0:
