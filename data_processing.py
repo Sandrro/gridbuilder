@@ -551,6 +551,8 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom, deadline: Opti
     rings: Dict[int, List[int]] = defaultdict(list)
     for idx, cell in enumerate(cells):
         ring = cell["ring_index"] if cell["ring_index"] is not None else 0
+        if "_visit_order" not in cell:
+            _mark_visited(idx)
         rings[ring].append(idx)
 
     for ring, idxs in rings.items():
