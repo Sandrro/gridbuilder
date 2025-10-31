@@ -509,6 +509,12 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom, deadline: Opti
     zone_boundary = zone_geom.boundary
     index_map = {(cell["row"], cell["col"]): idx for idx, cell in enumerate(cells)}
     queue: deque[int] = deque()
+    visit_counter = 0
+
+    def _mark_visited(cell_idx: int) -> None:
+        nonlocal visit_counter
+        cells[cell_idx]["_visit_order"] = visit_counter
+        visit_counter += 1
 
     for idx, cell in enumerate(cells):
         intersection = cell["intersection"]
@@ -516,12 +522,14 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom, deadline: Opti
             continue
         if intersection.touches(zone_boundary) or math.isclose(intersection.area, cell["geometry"].area, rel_tol=1e-9, abs_tol=1e-9) and not zone_geom.contains(cell["geometry"].centroid):
             cell["ring_index"] = 0
+            _mark_visited(idx)
             queue.append(idx)
 
     if not queue:
         # If every cell is interior (e.g., a single cell), choose all as ring 0.
         for idx in range(len(cells)):
             cells[idx]["ring_index"] = 0
+            _mark_visited(idx)
             queue.append(idx)
 
     while queue:
@@ -537,6 +545,7 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom, deadline: Opti
             if neighbor_cell["ring_index"] is not None:
                 continue
             neighbor_cell["ring_index"] = current_cell["ring_index"] + 1
+            _mark_visited(neighbor_idx)
             queue.append(neighbor_idx)
 
     rings: Dict[int, List[int]] = defaultdict(list)
@@ -546,8 +555,9 @@ def _assign_ring_order(cells: List[Dict[str, object]], zone_geom, deadline: Opti
 
     for ring, idxs in rings.items():
         _check_deadline(deadline)
-        for order, cell_idx in enumerate(sorted(idxs, key=lambda i: (cells[i]["row"], cells[i]["col"]))):
+        for order, cell_idx in enumerate(sorted(idxs, key=lambda i: cells[i]["_visit_order"])):
             cells[cell_idx]["ring_order"] = order
+            cells[cell_idx].pop("_visit_order", None)
 
 
 def _distribute_values(cells: List[Dict[str, object]], building_lookup: Dict[object, BuildingRecord],
